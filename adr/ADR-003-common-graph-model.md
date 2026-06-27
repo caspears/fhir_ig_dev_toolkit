@@ -25,7 +25,8 @@ remain independent of any specific visualization or storage technology
 
 All relationship discovery components shall produce this common graph model.
 
-Analysis components and renderers shall consume the common graph model rather than directly parsing source artifacts.
+Analysis and rendering components shall consume the common graph model and shall not directly parse source artifacts unless they are themselves acting as artifact discovery components.
+
 
 ## Consequences
 Benefits
