@@ -110,6 +110,31 @@ This becomes the common engine that everything else uses.
 | ☐          | Binding strength visualization |
 | ☐          | Unused terminology detection   |
 
+#### THO Proposal Assistant MVP
+
+A small, local workflow for preparing selected IG-owned CodeSystems and
+ValueSets for submission to HL7 Terminology (THO). This is intended primarily
+for personal use and, potentially, a small number of close collaborators. It is
+not intended to be a general-purpose submission platform.
+
+Initial scope:
+
+- Analyze one candidate CodeSystem from JSON or XML.
+- Produce a normalized summary and a human-readable concept inventory.
+- Collect proposal decisions with a FHIR Questionnaire/QuestionnaireResponse.
+- Use focused CQL rules for readiness and derived requirements where practical.
+- Use StructureMap to generate draft CodeSystem and ValueSet resources.
+- Generate draft Jira proposal text and a proposal-specific author checklist.
+- Keep repository changes, voting, and governance decisions under human control.
+
+Deferred from the MVP:
+
+- Jira and GitLab API integration.
+- Automated OID allocation.
+- Automated voting and voter outreach.
+- Multi-user hosting, permissions, and workflow administration.
+- Comprehensive support for every THO product family and artifact type.
+
 ### Phase 5 - IG Dependency Analysis - Understanding Dependencies
 
 | **Status** | **Use Case**                  |

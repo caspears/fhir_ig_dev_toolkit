@@ -1,0 +1,28 @@
+# THO Proposal Assistant
+
+This directory contains a small local MVP for preparing IG-owned terminology
+for an HL7 Terminology (THO) proposal.
+
+The first implemented command analyzes a FHIR CodeSystem in JSON or XML and
+writes:
+
+- `analysis.json` - normalized metadata and concept information.
+- `concept-inventory.md` - a human-readable concept table and review summary.
+
+## Run
+
+```bash
+python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
+  --output-dir build/tho-analysis
+```
+
+XML input is also supported. The command uses only the Python standard library.
+
+## Current limitations
+
+- Only CodeSystem resources are accepted.
+- THO candidate matching is not yet implemented.
+- Questionnaire, CQL, and StructureMap artifacts will be added after the
+  normalized analysis is tested against a real candidate.
+- The generated review flags are prompts for human review, not governance
+  conclusions.
