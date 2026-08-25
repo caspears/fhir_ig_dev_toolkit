@@ -1,7 +1,9 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).parents[1] / "tho_assistant.py"
@@ -50,6 +52,92 @@ class AnalyzerTests(unittest.TestCase):
             "http://terminology.hl7.org/CodeSystem/benefit-type",
             match["target_canonicals"],
         )
+
+    def test_finds_valueset_usage(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        usages = tho_assistant.find_valueset_usage(
+            resource["url"], self.formulary_fixture.parent
+        )
+
+        self.assertEqual(len(usages), 1)
+        self.assertEqual(usages[0]["id"], "BenefitCostTypeVS")
+        self.assertEqual(usages[0]["inclusion"], "all-codes")
+        self.assertEqual(usages[0]["other_code_systems"], [])
+
+    def test_builds_contextual_jira_query(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        usages = tho_assistant.find_valueset_usage(
+            resource["url"], self.formulary_fixture.parent
+        )
+        jql = tho_assistant.build_proposal_jql(resource, usages)
+
+        self.assertIn("project = UP", jql)
+        self.assertIn('text ~ "copay"', jql)
+        self.assertIn('text ~ "Benefit type of cost"', jql)
+
+    def test_live_search_uses_bearer_token_without_returning_it(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"issues": []}'
+
+        with mock.patch.object(
+            tho_assistant.request, "urlopen", return_value=Response()
+        ) as urlopen:
+            result = tho_assistant.search_jira_proposals(
+                "https://jira.example.test",
+                "project = UP",
+                token="secret-test-token",
+            )
+
+        sent_request = urlopen.call_args.args[0]
+        query = tho_assistant.parse.parse_qs(
+            tho_assistant.parse.urlsplit(sent_request.full_url).query
+        )
+        self.assertTrue(sent_request.full_url.startswith(
+            "https://jira.example.test/rest/api/2/search?"
+        ))
+        self.assertEqual(sent_request.get_method(), "GET")
+        self.assertEqual(
+            sent_request.headers["Authorization"], "Bearer secret-test-token"
+        )
+        self.assertEqual(query["jql"], ["project = UP"])
+        self.assertEqual(result, {"issues": []})
+        self.assertNotIn("secret-test-token", json.dumps(result))
+
+    def test_live_search_uses_browser_cookie_instead_of_pat(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"issues": []}'
+
+        with mock.patch.object(
+            tho_assistant.request, "urlopen", return_value=Response()
+        ) as urlopen:
+            result = tho_assistant.search_jira_proposals(
+                "https://jira.hl7.org",
+                "project = UP",
+                token="unused-pat",
+                cookie="JSESSIONID=secret-session",
+            )
+
+        sent_request = urlopen.call_args.args[0]
+        self.assertEqual(
+            sent_request.headers["Cookie"], "JSESSIONID=secret-session"
+        )
+        self.assertNotIn("Authorization", sent_request.headers)
+        self.assertEqual(result, {"issues": []})
+        self.assertNotIn("secret-session", json.dumps(result))
 
     def test_xml_input(self):
         xml = """<CodeSystem xmlns=\"http://hl7.org/fhir\">

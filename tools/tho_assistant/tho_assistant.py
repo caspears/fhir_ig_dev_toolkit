@@ -7,11 +7,14 @@ python tools/tho_assistant/tho_assistant.py analyze tools\\tho_assistant\\tests\
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib import error, parse, request
 from xml.etree import ElementTree
 
 
@@ -74,6 +77,14 @@ def _xml_value(element: ElementTree.Element) -> Any:
 
 
 def load_resource(path: Path) -> dict[str, Any]:
+    resource = load_fhir_resource(path)
+    if resource.get("resourceType") != "CodeSystem":
+        actual = resource.get("resourceType", "unknown")
+        raise AnalysisError(f"Expected CodeSystem, found {actual}")
+    return resource
+
+
+def load_fhir_resource(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     try:
         if suffix == ".json":
@@ -87,9 +98,8 @@ def load_resource(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, ElementTree.ParseError) as error:
         raise AnalysisError(f"Unable to read {path}: {error}") from error
 
-    if resource.get("resourceType") != "CodeSystem":
-        actual = resource.get("resourceType", "unknown")
-        raise AnalysisError(f"Expected CodeSystem, found {actual}")
+    if not isinstance(resource, dict):
+        raise AnalysisError(f"Expected a FHIR JSON object in {path}")
     return resource
 
 
@@ -216,6 +226,142 @@ def _jira_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raise AnalysisError("Jira JSON must contain an issue or an issues array")
 
 
+def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[str, Any]]:
+    """Find local ValueSets that directly include the candidate CodeSystem."""
+    if not candidate_url:
+        return []
+    usages: list[dict[str, Any]] = []
+    paths = sorted(set(ig_dir.rglob("*.json")) | set(ig_dir.rglob("*.xml")))
+    for path in paths:
+        try:
+            resource = load_fhir_resource(path)
+        except AnalysisError:
+            continue
+        if resource.get("resourceType") != "ValueSet":
+            continue
+        includes = [
+            item
+            for item in _as_list((resource.get("compose") or {}).get("include"))
+            if isinstance(item, dict)
+        ]
+        matching = [item for item in includes if item.get("system") == candidate_url]
+        if not matching:
+            continue
+        other_systems = sorted(
+            {
+                item["system"]
+                for item in includes
+                if item.get("system") != candidate_url and item.get("system")
+            }
+        )
+        selected_codes = sorted(
+            {
+                concept["code"]
+                for item in matching
+                for concept in _as_list(item.get("concept"))
+                if isinstance(concept, dict) and concept.get("code")
+            }
+        )
+        usages.append(
+            {
+                "source": str(path.resolve()),
+                "id": resource.get("id"),
+                "url": resource.get("url"),
+                "name": resource.get("name"),
+                "title": resource.get("title"),
+                "description": resource.get("description"),
+                "inclusion": "selected-codes" if selected_codes else "all-codes",
+                "selected_codes": selected_codes,
+                "other_code_systems": other_systems,
+                "tho_code_systems": [
+                    system
+                    for system in other_systems
+                    if system.startswith("http://terminology.hl7.org/CodeSystem/")
+                    or system.startswith("https://terminology.hl7.org/CodeSystem/")
+                ],
+            }
+        )
+    return usages
+
+
+def _jql_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_proposal_jql(resource: dict[str, Any], usages: list[dict[str, Any]]) -> str:
+    terms: list[str] = []
+    for value in (resource.get("url"), resource.get("name"), resource.get("title")):
+        if isinstance(value, str) and value.strip():
+            terms.append(value.strip())
+    concepts = _flatten_concepts(
+        [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
+    )
+    for concept in concepts:
+        for field in ("code", "display"):
+            value = concept.get(field)
+            if isinstance(value, str) and value.strip():
+                terms.append(value.strip())
+    for usage in usages:
+        for field in ("url", "name", "title"):
+            value = usage.get(field)
+            if isinstance(value, str) and value.strip():
+                terms.append(value.strip())
+    clauses = [
+        f'text ~ "{_jql_text(term)}"' for term in dict.fromkeys(terms)
+    ]
+    return "project = UP AND (" + " OR ".join(clauses) + ") ORDER BY updated DESC"
+
+
+def search_jira_proposals(
+    jira_url: str,
+    jql: str,
+    token: str | None = None,
+    cookie: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    if not token and not cookie:
+        raise AnalysisError("Jira search requires a PAT or browser-session cookie")
+    query = parse.urlencode(
+        {"jql": jql, "maxResults": 50, "fields": "*all"}
+    )
+    endpoint = jira_url.rstrip("/") + "/rest/api/2/search?" + query
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36"
+        ),
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+    api_request = request.Request(
+        endpoint,
+        method="GET",
+        headers=headers,
+    )
+    try:
+        with request.urlopen(api_request, timeout=timeout) as response:
+            payload = json.load(response)
+    except error.HTTPError as exc:
+        detail = exc.read(500).decode("utf-8", errors="replace")
+        if exc.code == 403 and "awselb" in str(exc.headers).lower():
+            raise AnalysisError(
+                "HL7's AWS front end rejected Jira REST authentication. "
+                "HL7 currently requires an authenticated browser-session cookie; "
+                "set HL7_JIRA_COOKIE from a signed-in browser request."
+            ) from exc
+        raise AnalysisError(
+            f"HL7 Jira search failed with HTTP {exc.code}: {detail}"
+        ) from exc
+    except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise AnalysisError(f"Unable to search HL7 Jira: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("issues"), list):
+        raise AnalysisError("HL7 Jira returned an unexpected search response")
+    return payload
+
+
 def match_proposals(
     concepts: list[dict[str, Any]], proposal_payloads: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -274,6 +420,7 @@ def analyze(
     resource: dict[str, Any],
     source: Path,
     proposal_payloads: list[dict[str, Any]] | None = None,
+    valueset_usage: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     concepts = _flatten_concepts(
         [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
@@ -291,6 +438,8 @@ def analyze(
     }
     if proposal_payloads:
         result["proposal_matches"] = match_proposals(concepts, proposal_payloads)
+    if valueset_usage is not None:
+        result["valueset_usage"] = valueset_usage
     return result
 
 
@@ -350,6 +499,27 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         else:
             lines.append("No related proposal was found in the supplied Jira data.")
 
+    if "valueset_usage" in analysis:
+        lines.extend(["", "## Local ValueSet usage", ""])
+        usages = analysis["valueset_usage"]
+        if usages:
+            lines.extend([
+                "| ValueSet | Inclusion | Other CodeSystems | THO co-inclusions |",
+                "|---|---|---|---|",
+            ])
+            for usage in usages:
+                label = usage.get("title") or usage.get("name") or usage.get("id")
+                lines.append(
+                    "| " + " | ".join([
+                        _escape_table(label),
+                        _escape_table(usage.get("inclusion")),
+                        _escape_table(", ".join(usage.get("other_code_systems", []))),
+                        _escape_table(", ".join(usage.get("tho_code_systems", []))),
+                    ]) + " |"
+                )
+        else:
+            lines.append("No local ValueSet directly includes the candidate CodeSystem.")
+
     lines.extend([
         "",
         "## Concepts",
@@ -375,7 +545,29 @@ def command_analyze(args: argparse.Namespace) -> int:
     proposal_payloads = [
         _load_json_or_fenced_json(path.resolve()) for path in args.proposal_file
     ]
-    result = analyze(resource, source, proposal_payloads)
+    valueset_usage = (
+        find_valueset_usage(resource.get("url"), args.ig_dir.resolve())
+        if args.ig_dir else None
+    )
+    if args.search_proposals:
+        cookie = os.environ.get("HL7_JIRA_COOKIE")
+        token = os.environ.get("HL7_JIRA_PAT")
+        if not cookie and not token:
+            if not sys.stdin.isatty():
+                raise AnalysisError(
+                    "HL7_JIRA_COOKIE or HL7_JIRA_PAT is not set and a secure "
+                    "prompt is unavailable"
+                )
+            cookie = getpass.getpass("HL7 Jira browser Cookie header: ")
+        if not cookie and not token:
+            raise AnalysisError("HL7 Jira authentication is required")
+        jql = build_proposal_jql(resource, valueset_usage or [])
+        proposal_payloads.append(
+            search_jira_proposals(
+                args.jira_url, jql, token=token, cookie=cookie
+            )
+        )
+    result = analyze(resource, source, proposal_payloads, valueset_usage)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -398,11 +590,26 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("input", type=Path, help="FHIR CodeSystem JSON or XML")
     analyze_parser.add_argument("--output-dir", type=Path, required=True, help="Directory for generated analysis")
     analyze_parser.add_argument(
+        "--ig-dir",
+        type=Path,
+        help="IG directory to scan recursively for ValueSets using the candidate",
+    )
+    analyze_parser.add_argument(
         "--proposal-file",
         action="append",
         default=[],
         type=Path,
         help="Jira issue or search-response JSON; may be repeated",
+    )
+    analyze_parser.add_argument(
+        "--search-proposals",
+        action="store_true",
+        help="Search Jira using HL7_JIRA_COOKIE or HL7_JIRA_PAT",
+    )
+    analyze_parser.add_argument(
+        "--jira-url",
+        default="https://jira.hl7.org",
+        help="Jira base URL (default: https://jira.hl7.org)",
     )
     analyze_parser.set_defaults(handler=command_analyze)
     return parser

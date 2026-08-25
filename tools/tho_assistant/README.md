@@ -31,12 +31,46 @@ Proposal matching currently identifies exact code mentions and target HL7
 CodeSystem/ValueSet canonicals. A full match means all candidate codes were
 mentioned in the proposal; it does not mean their definitions are identical.
 
+To scan an IG directory for ValueSets that directly include the candidate:
+
+```bash
+python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
+  --ig-dir path/to/ig \
+  --output-dir build/tho-analysis
+```
+
+HL7's AWS front end currently rejects PAT-only REST requests, while REST calls
+made with an authenticated browser session work. For proposal discovery, copy
+the `Cookie` request-header value from a signed-in Jira REST request into the
+`HL7_JIRA_COOKIE` environment variable and add `--search-proposals`. The cookie
+is held only in memory and is not written to reports. Do not commit it or pass
+it as a command-line argument.
+
+For example, in the browser developer tools, reload
+`https://jira.hl7.org/rest/api/2/myself`, select the request in the Network tab,
+and copy only its `Cookie` request-header value. Then, in PowerShell:
+
+```powershell
+$env:HL7_JIRA_COOKIE = "cookie-name=cookie-value; another-name=another-value"
+```
+
+```bash
+python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
+  --ig-dir path/to/ig \
+  --search-proposals \
+  --output-dir build/tho-analysis
+```
+
+`HL7_JIRA_PAT` remains supported for Jira deployments whose front end permits
+Bearer authentication. If both variables are present, the browser cookie is
+used. Browser sessions expire, so the cookie may need to be refreshed.
+
 ## Current limitations
 
 - Only CodeSystem resources are accepted.
 - THO artifact matching is not yet implemented.
-- Jira proposal data must currently be supplied as exported JSON; live Jira
-  search is not yet implemented.
+- Jira search currently uses exact text evidence; semantic comparison of code
+  definitions is not yet implemented.
 - Questionnaire, CQL, and StructureMap artifacts will be added after the
   normalized analysis is tested against a real candidate.
 - The generated review flags are prompts for human review, not governance
