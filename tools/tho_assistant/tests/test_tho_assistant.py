@@ -14,6 +14,15 @@ SPEC.loader.exec_module(tho_assistant)
 class AnalyzerTests(unittest.TestCase):
     def setUp(self):
         self.fixture = Path(__file__).parent / "fixtures" / "CodeSystem-example.json"
+        self.formulary_fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "formulary"
+            / "CodeSystem-usdf-BenefitCostTypeCS-TEMPORARY-TRIAL-USE.json"
+        )
+        self.proposal_fixture = (
+            Path(__file__).parent / "fixtures" / "proposals" / "UP-814.json"
+        )
 
     def test_analyzes_nested_concepts(self):
         resource = tho_assistant.load_resource(self.fixture)
@@ -23,6 +32,24 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(analysis["concepts"][2]["code"], "verified")
         self.assertEqual(analysis["concepts"][2]["parent"], "completed")
         self.assertEqual(analysis["review_flags"], [])
+
+    def test_matches_up_814_to_all_formulary_codes(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        proposal = tho_assistant._load_json_or_fenced_json(self.proposal_fixture)
+        analysis = tho_assistant.analyze(
+            resource, self.formulary_fixture, [proposal]
+        )
+
+        self.assertEqual(len(analysis["proposal_matches"]), 1)
+        match = analysis["proposal_matches"][0]
+        self.assertEqual(match["key"], "UP-814")
+        self.assertEqual(match["status"], "Consensus Review")
+        self.assertEqual(match["coverage"], "full")
+        self.assertEqual(match["matched_codes"], ["copay", "coinsurance"])
+        self.assertIn(
+            "http://terminology.hl7.org/CodeSystem/benefit-type",
+            match["target_canonicals"],
+        )
 
     def test_xml_input(self):
         xml = """<CodeSystem xmlns=\"http://hl7.org/fhir\">

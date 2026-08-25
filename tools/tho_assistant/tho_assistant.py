@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,24 @@ def load_resource(path: Path) -> dict[str, Any]:
         actual = resource.get("resourceType", "unknown")
         raise AnalysisError(f"Expected CodeSystem, found {actual}")
     return resource
+
+
+def _load_json_or_fenced_json(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8-sig").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        value = json.loads(text)
+    except (OSError, json.JSONDecodeError) as error:
+        raise AnalysisError(f"Unable to read Jira JSON from {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise AnalysisError(f"Expected a JSON object in Jira input {path}")
+    return value
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -177,12 +196,90 @@ def _review_flags(resource: dict[str, Any], concepts: list[dict[str, Any]]) -> l
     return flags
 
 
-def analyze(resource: dict[str, Any], source: Path) -> dict[str, Any]:
+def _iter_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_strings(child)
+
+
+def _jira_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("key") and isinstance(payload.get("fields"), dict):
+        return [payload]
+    issues = payload.get("issues")
+    if isinstance(issues, list):
+        return [issue for issue in issues if isinstance(issue, dict)]
+    raise AnalysisError("Jira JSON must contain an issue or an issues array")
+
+
+def match_proposals(
+    concepts: list[dict[str, Any]], proposal_payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    candidate_codes = [
+        concept["code"] for concept in concepts if isinstance(concept.get("code"), str)
+    ]
+    matches: list[dict[str, Any]] = []
+    for payload in proposal_payloads:
+        for issue in _jira_issues(payload):
+            fields = issue.get("fields") or {}
+            searchable_text = "\n".join(_iter_strings(fields))
+            mentioned_codes = [
+                code
+                for code in candidate_codes
+                if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(code)}(?![A-Za-z0-9_-])", searchable_text)
+            ]
+            canonicals = sorted(
+                set(
+                    re.findall(
+                        r"https?://(?:terminology\.hl7\.org|hl7\.org/fhir)/"
+                        r"(?:CodeSystem|ValueSet)/[A-Za-z0-9._-]+",
+                        searchable_text,
+                    )
+                )
+            )
+            if not mentioned_codes and not canonicals:
+                continue
+            if candidate_codes and len(mentioned_codes) == len(candidate_codes):
+                coverage = "full"
+            elif mentioned_codes:
+                coverage = "partial"
+            else:
+                coverage = "artifact-only"
+            status = fields.get("status") or {}
+            resolution = fields.get("resolution")
+            matches.append(
+                {
+                    "key": issue.get("key"),
+                    "url": f"https://jira.hl7.org/browse/{issue.get('key')}",
+                    "summary": fields.get("summary"),
+                    "status": status.get("name") if isinstance(status, dict) else status,
+                    "resolution": (
+                        resolution.get("name")
+                        if isinstance(resolution, dict)
+                        else resolution
+                    ),
+                    "coverage": coverage,
+                    "matched_codes": mentioned_codes,
+                    "target_canonicals": canonicals,
+                }
+            )
+    return matches
+
+
+def analyze(
+    resource: dict[str, Any],
+    source: Path,
+    proposal_payloads: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     concepts = _flatten_concepts(
         [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
     )
     metadata = {field: resource[field] for field in METADATA_FIELDS if field in resource}
-    return {
+    result = {
         "schema_version": "0.1.0",
         "source": str(source),
         "resource_type": "CodeSystem",
@@ -192,6 +289,9 @@ def analyze(resource: dict[str, Any], source: Path) -> dict[str, Any]:
         "concepts": concepts,
         "review_flags": _review_flags(resource, concepts),
     }
+    if proposal_payloads:
+        result["proposal_matches"] = match_proposals(concepts, proposal_payloads)
+    return result
 
 
 def _escape_table(value: Any) -> str:
@@ -217,7 +317,38 @@ def render_markdown(analysis: dict[str, Any]) -> str:
     if flags:
         lines.extend(f"- **{flag['severity'].upper()}**: {flag['message']}" for flag in flags)
     else:
-        lines.append("No initial structural review flags were found.")
+        lines.append(
+            "No initial source-structure flags were found. THO artifact matching "
+            "and governance review are still required."
+        )
+
+    if "proposal_matches" in analysis:
+        lines.extend(["", "## Related THO proposals", ""])
+        proposals = analysis["proposal_matches"]
+        if proposals:
+            lines.extend(
+                [
+                    "| Proposal | Status | Coverage | Matching codes | Target artifacts |",
+                    "|---|---|---|---|---|",
+                ]
+            )
+            for proposal in proposals:
+                proposal_link = f"[{proposal['key']}]({proposal['url']})"
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            proposal_link,
+                            _escape_table(proposal.get("status")),
+                            _escape_table(proposal.get("coverage")),
+                            _escape_table(", ".join(proposal.get("matched_codes", []))),
+                            _escape_table(", ".join(proposal.get("target_canonicals", []))),
+                        ]
+                    )
+                    + " |"
+                )
+        else:
+            lines.append("No related proposal was found in the supplied Jira data.")
 
     lines.extend([
         "",
@@ -241,7 +372,10 @@ def command_analyze(args: argparse.Namespace) -> int:
     source = args.input.resolve()
     output_dir = args.output_dir.resolve()
     resource = load_resource(source)
-    result = analyze(resource, source)
+    proposal_payloads = [
+        _load_json_or_fenced_json(path.resolve()) for path in args.proposal_file
+    ]
+    result = analyze(resource, source, proposal_payloads)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -263,6 +397,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a candidate CodeSystem")
     analyze_parser.add_argument("input", type=Path, help="FHIR CodeSystem JSON or XML")
     analyze_parser.add_argument("--output-dir", type=Path, required=True, help="Directory for generated analysis")
+    analyze_parser.add_argument(
+        "--proposal-file",
+        action="append",
+        default=[],
+        type=Path,
+        help="Jira issue or search-response JSON; may be repeated",
+    )
     analyze_parser.set_defaults(handler=command_analyze)
     return parser
 

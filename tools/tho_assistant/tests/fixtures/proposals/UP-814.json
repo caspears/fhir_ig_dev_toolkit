@@ -1,0 +1,13 @@
+{
+  "id": "283920",
+  "key": "UP-814",
+  "fields": {
+    "summary": "Add codes to the Benefit Type Codes CodeSystem and improve definitions of existing codes",
+    "status": {
+      "name": "Consensus Review"
+    },
+    "resolution": null,
+    "customfield_10426": "Update the Benefit Type Code System (http://terminology.hl7.org/CodeSystem/benefit-type) and corresponding ValueSet (http://terminology.hl7.org/ValueSet/benefit-type). Proposed codes include copay and coinsurance.",
+    "customfield_13305": "Modified: input/sourceOfTruth/fhir/codeSystems/CodeSystem-benefit-type.xml"
+  }
+}
