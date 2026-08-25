@@ -230,8 +230,18 @@ def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[st
     """Find local ValueSets that directly include the candidate CodeSystem."""
     if not candidate_url:
         return []
-    usages: list[dict[str, Any]] = []
-    paths = sorted(set(ig_dir.rglob("*.json")) | set(ig_dir.rglob("*.xml")))
+    generated_resources = ig_dir / "fsh-generated" / "resources"
+    output_dir = ig_dir / "output"
+    if generated_resources.is_dir():
+        scan_dir = generated_resources
+        paths = sorted(set(scan_dir.glob("ValueSet-*.json")) | set(scan_dir.glob("ValueSet-*.xml")))
+    elif output_dir.is_dir():
+        scan_dir = output_dir
+        paths = sorted(set(scan_dir.glob("ValueSet-*.json")) | set(scan_dir.glob("ValueSet-*.xml")))
+    else:
+        direct_paths = set(ig_dir.glob("ValueSet-*.json")) | set(ig_dir.glob("ValueSet-*.xml"))
+        paths = sorted(direct_paths or (set(ig_dir.rglob("ValueSet-*.json")) | set(ig_dir.rglob("ValueSet-*.xml"))))
+    usages_by_identity: dict[str, dict[str, Any]] = {}
     for path in paths:
         try:
             resource = load_fhir_resource(path)
@@ -262,9 +272,11 @@ def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[st
                 if isinstance(concept, dict) and concept.get("code")
             }
         )
-        usages.append(
-            {
-                "source": str(path.resolve()),
+        identity = resource.get("url") or resource.get("id") or str(path.resolve())
+        usage = usages_by_identity.get(identity)
+        if usage is None:
+            usage = {
+                "sources": [],
                 "id": resource.get("id"),
                 "url": resource.get("url"),
                 "name": resource.get("name"),
@@ -280,8 +292,19 @@ def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[st
                     or system.startswith("https://terminology.hl7.org/CodeSystem/")
                 ],
             }
+            usages_by_identity[identity] = usage
+        usage["sources"].append(str(path.resolve()))
+        usage["selected_codes"] = sorted(set(usage["selected_codes"]) | set(selected_codes))
+        usage["other_code_systems"] = sorted(set(usage["other_code_systems"]) | set(other_systems))
+        usage["tho_code_systems"] = sorted(
+            set(usage["tho_code_systems"])
+            | {
+                system for system in other_systems
+                if system.startswith("http://terminology.hl7.org/CodeSystem/")
+                or system.startswith("https://terminology.hl7.org/CodeSystem/")
+            }
         )
-    return usages
+    return list(usages_by_identity.values())
 
 
 def _jql_text(value: str) -> str:
@@ -362,12 +385,42 @@ def search_jira_proposals(
     return payload
 
 
+def _mentioned_terms(terms: list[str], text: str) -> list[str]:
+    return [
+        term for term in terms
+        if re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
 def match_proposals(
-    concepts: list[dict[str, Any]], proposal_payloads: list[dict[str, Any]]
+    resource: dict[str, Any],
+    concepts: list[dict[str, Any]],
+    proposal_payloads: list[dict[str, Any]],
+    valueset_usage: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     candidate_codes = [
         concept["code"] for concept in concepts if isinstance(concept.get("code"), str)
     ]
+    contextual_terms = [
+        value
+        for value in (
+            resource.get("name"),
+            resource.get("title"),
+            *(concept.get("display") for concept in concepts),
+            *(usage.get(field) for usage in (valueset_usage or []) for field in ("name", "title")),
+        )
+        if isinstance(value, str) and value.strip()
+    ]
+    contextual_terms = list(dict.fromkeys(contextual_terms))
+    local_canonicals = {
+        value
+        for value in (resource.get("url"), *(usage.get("url") for usage in (valueset_usage or [])))
+        if isinstance(value, str) and value
+    }
     matches: list[dict[str, Any]] = []
     for payload in proposal_payloads:
         for issue in _jira_issues(payload):
@@ -378,23 +431,30 @@ def match_proposals(
                 for code in candidate_codes
                 if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(code)}(?![A-Za-z0-9_-])", searchable_text)
             ]
+            matched_terms = _mentioned_terms(contextual_terms, searchable_text)
             canonicals = sorted(
                 set(
-                    re.findall(
+                    canonical.rstrip(".")
+                    for canonical in re.findall(
                         r"https?://(?:terminology\.hl7\.org|hl7\.org/fhir)/"
                         r"(?:CodeSystem|ValueSet)/[A-Za-z0-9._-]+",
                         searchable_text,
                     )
                 )
             )
-            if not mentioned_codes and not canonicals:
+            matched_local_canonicals = sorted(
+                canonical for canonical in local_canonicals if canonical in searchable_text
+            )
+            if not mentioned_codes and not matched_terms and not matched_local_canonicals:
                 continue
             if candidate_codes and len(mentioned_codes) == len(candidate_codes):
                 coverage = "full"
             elif mentioned_codes:
                 coverage = "partial"
+            elif matched_local_canonicals:
+                coverage = "artifact"
             else:
-                coverage = "artifact-only"
+                coverage = "contextual"
             status = fields.get("status") or {}
             resolution = fields.get("resolution")
             matches.append(
@@ -410,10 +470,13 @@ def match_proposals(
                     ),
                     "coverage": coverage,
                     "matched_codes": mentioned_codes,
+                    "matched_terms": matched_terms,
+                    "matched_local_canonicals": matched_local_canonicals,
                     "target_canonicals": canonicals,
                 }
             )
-    return matches
+    rank = {"full": 0, "partial": 1, "artifact": 2, "contextual": 3}
+    return sorted(matches, key=lambda item: (rank[item["coverage"]], item.get("key") or ""))
 
 
 def analyze(
@@ -437,7 +500,9 @@ def analyze(
         "review_flags": _review_flags(resource, concepts),
     }
     if proposal_payloads:
-        result["proposal_matches"] = match_proposals(concepts, proposal_payloads)
+        result["proposal_matches"] = match_proposals(
+            resource, concepts, proposal_payloads, valueset_usage
+        )
     if valueset_usage is not None:
         result["valueset_usage"] = valueset_usage
     return result
@@ -477,7 +542,7 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         if proposals:
             lines.extend(
                 [
-                    "| Proposal | Status | Coverage | Matching codes | Target artifacts |",
+                    "| Proposal | Status | Match | Evidence | Target artifacts |",
                     "|---|---|---|---|---|",
                 ]
             )
@@ -490,7 +555,11 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                             proposal_link,
                             _escape_table(proposal.get("status")),
                             _escape_table(proposal.get("coverage")),
-                            _escape_table(", ".join(proposal.get("matched_codes", []))),
+                            _escape_table(", ".join(
+                                proposal.get("matched_codes", [])
+                                or proposal.get("matched_terms", [])
+                                or proposal.get("matched_local_canonicals", [])
+                            )),
                             _escape_table(", ".join(proposal.get("target_canonicals", []))),
                         ]
                     )
@@ -538,6 +607,40 @@ def render_markdown(analysis: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def get_jira_credentials() -> tuple[str | None, str | None]:
+    cookie = os.environ.get("HL7_JIRA_COOKIE")
+    token = os.environ.get("HL7_JIRA_PAT")
+    if not cookie and not token:
+        if not sys.stdin.isatty():
+            raise AnalysisError(
+                "HL7_JIRA_COOKIE or HL7_JIRA_PAT is not set and a secure "
+                "prompt is unavailable"
+            )
+        cookie = getpass.getpass("HL7 Jira browser Cookie header: ")
+    if not cookie and not token:
+        raise AnalysisError("HL7 Jira authentication is required")
+    return token, cookie
+
+
+def test_jira_access(
+    jira_url: str, token: str | None, cookie: str | None
+) -> dict[str, Any]:
+    """Run a minimal UP-project search before any potentially slow IG scan."""
+    return search_jira_proposals(
+        jira_url, "project=UP", token=token, cookie=cookie
+    )
+
+
+def command_test_jira(args: argparse.Namespace) -> int:
+    token, cookie = get_jira_credentials()
+    payload = test_jira_access(args.jira_url, token, cookie)
+    total = payload.get("total", len(payload.get("issues", [])))
+    auth_type = "browser session" if cookie else "personal access token"
+    print(f"HL7 Jira connection succeeded using {auth_type}.")
+    print(f"Project UP is visible ({total} matching issues reported).")
+    return 0
+
+
 def command_analyze(args: argparse.Namespace) -> int:
     source = args.input.resolve()
     output_dir = args.output_dir.resolve()
@@ -545,22 +648,17 @@ def command_analyze(args: argparse.Namespace) -> int:
     proposal_payloads = [
         _load_json_or_fenced_json(path.resolve()) for path in args.proposal_file
     ]
+    token: str | None = None
+    cookie: str | None = None
+    if args.search_proposals:
+        token, cookie = get_jira_credentials()
+        test_jira_access(args.jira_url, token, cookie)
+        print("HL7 Jira preflight succeeded; scanning local IG content.")
     valueset_usage = (
         find_valueset_usage(resource.get("url"), args.ig_dir.resolve())
         if args.ig_dir else None
     )
     if args.search_proposals:
-        cookie = os.environ.get("HL7_JIRA_COOKIE")
-        token = os.environ.get("HL7_JIRA_PAT")
-        if not cookie and not token:
-            if not sys.stdin.isatty():
-                raise AnalysisError(
-                    "HL7_JIRA_COOKIE or HL7_JIRA_PAT is not set and a secure "
-                    "prompt is unavailable"
-                )
-            cookie = getpass.getpass("HL7 Jira browser Cookie header: ")
-        if not cookie and not token:
-            raise AnalysisError("HL7 Jira authentication is required")
         jql = build_proposal_jql(resource, valueset_usage or [])
         proposal_payloads.append(
             search_jira_proposals(
@@ -586,6 +684,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Prepare IG terminology for a THO proposal"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    test_parser = subparsers.add_parser(
+        "test-jira", help="Test Jira authentication and access to project UP"
+    )
+    test_parser.add_argument(
+        "--jira-url",
+        default="https://jira.hl7.org",
+        help="Jira base URL (default: https://jira.hl7.org)",
+    )
+    test_parser.set_defaults(handler=command_test_jira)
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a candidate CodeSystem")
     analyze_parser.add_argument("input", type=Path, help="FHIR CodeSystem JSON or XML")
     analyze_parser.add_argument("--output-dir", type=Path, required=True, help="Directory for generated analysis")

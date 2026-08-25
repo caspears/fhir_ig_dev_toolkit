@@ -63,6 +63,53 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(usages[0]["id"], "BenefitCostTypeVS")
         self.assertEqual(usages[0]["inclusion"], "all-codes")
         self.assertEqual(usages[0]["other_code_systems"], [])
+        self.assertEqual(len(usages[0]["sources"]), 1)
+
+    def test_deduplicates_valueset_representations(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        source = self.formulary_fixture.parent / "ValueSet-BenefitCostTypeVS.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "a"
+            second = root / "b"
+            first.mkdir()
+            second.mkdir()
+            text = source.read_text(encoding="utf-8")
+            (first / source.name).write_text(text, encoding="utf-8")
+            (second / source.name).write_text(text, encoding="utf-8")
+            usages = tho_assistant.find_valueset_usage(resource["url"], root)
+
+        self.assertEqual(len(usages), 1)
+        self.assertEqual(len(usages[0]["sources"]), 2)
+
+    def test_filters_unrelated_jira_results_and_keeps_context(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        payload = {
+            "issues": [
+                {
+                    "key": "UP-UNRELATED",
+                    "fields": {
+                        "summary": "Device terminology",
+                        "description": "http://terminology.hl7.org/CodeSystem/device-kind",
+                        "status": {"name": "Draft"},
+                    },
+                },
+                {
+                    "key": "UP-CONTEXT",
+                    "fields": {
+                        "summary": "Update Coverage Copay Type Codes",
+                        "description": "http://terminology.hl7.org/CodeSystem/coverage-copay-type",
+                        "status": {"name": "Draft"},
+                    },
+                },
+            ]
+        }
+        concepts = tho_assistant._flatten_concepts(resource["concept"])
+        matches = tho_assistant.match_proposals(resource, concepts, [payload])
+
+        self.assertEqual([match["key"] for match in matches], ["UP-CONTEXT"])
+        self.assertEqual(matches[0]["coverage"], "contextual")
+        self.assertEqual(matches[0]["matched_terms"], ["Copay"])
 
     def test_builds_contextual_jira_query(self):
         resource = tho_assistant.load_resource(self.formulary_fixture)
@@ -138,6 +185,23 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("Authorization", sent_request.headers)
         self.assertEqual(result, {"issues": []})
         self.assertNotIn("secret-session", json.dumps(result))
+
+    def test_jira_preflight_uses_minimal_project_query(self):
+        expected = {"total": 1, "issues": [{"key": "UP-814"}]}
+        with mock.patch.object(
+            tho_assistant, "search_jira_proposals", return_value=expected
+        ) as search:
+            result = tho_assistant.test_jira_access(
+                "https://jira.hl7.org", None, "JSESSIONID=session"
+            )
+
+        search.assert_called_once_with(
+            "https://jira.hl7.org",
+            "project=UP",
+            token=None,
+            cookie="JSESSIONID=session",
+        )
+        self.assertEqual(result, expected)
 
     def test_xml_input(self):
         xml = """<CodeSystem xmlns=\"http://hl7.org/fhir\">

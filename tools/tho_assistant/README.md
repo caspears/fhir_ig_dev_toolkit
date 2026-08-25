@@ -39,6 +39,11 @@ python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
   --output-dir build/tho-analysis
 ```
 
+The scanner prefers `fsh-generated/resources`, then top-level `output`
+artifacts, and uses a recursive fallback only when neither standard location is
+available. It reads only `ValueSet-*` JSON/XML files and consolidates multiple
+representations by canonical URL.
+
 HL7's AWS front end currently rejects PAT-only REST requests, while REST calls
 made with an authenticated browser session work. For proposal discovery, copy
 the `Cookie` request-header value from a signed-in Jira REST request into the
@@ -53,6 +58,17 @@ and copy only its `Cookie` request-header value. Then, in PowerShell:
 ```powershell
 $env:HL7_JIRA_COOKIE = "cookie-name=cookie-value; another-name=another-value"
 ```
+
+Test Jira access before running the local IG scan:
+
+```powershell
+python tools/tho_assistant/tho_assistant.py test-jira
+```
+
+This performs only the same minimal `project=UP` Jira search that can be tested
+in the browser. The `analyze --search-proposals` command also runs this
+preflight before scanning `--ig-dir`, so authentication or project-access
+failures return immediately.
 
 ```bash
 python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
@@ -69,8 +85,9 @@ used. Browser sessions expire, so the cookie may need to be refreshed.
 
 - Only CodeSystem resources are accepted.
 - THO artifact matching is not yet implemented.
-- Jira search currently uses exact text evidence; semantic comparison of code
-  definitions is not yet implemented.
+- Jira results are ranked as full-code, partial-code, artifact, or contextual
+  matches. Unrelated results returned by Jira's text search are omitted.
+- Semantic comparison of code definitions is not yet implemented.
 - Questionnaire, CQL, and StructureMap artifacts will be added after the
   normalized analysis is tested against a real candidate.
 - The generated review flags are prompts for human review, not governance
