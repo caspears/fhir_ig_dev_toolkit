@@ -368,6 +368,12 @@ def search_jira_proposals(
         with request.urlopen(api_request, timeout=timeout) as response:
             payload = json.load(response)
     except error.HTTPError as exc:
+        if exc.code == 401:
+            raise AnalysisError(
+                "HL7 Jira rejected the browser session (HTTP 401). "
+                "The cookie may have expired; please verify and/or update "
+                "HL7_JIRA_COOKIE."
+            ) from exc
         detail = exc.read(500).decode("utf-8", errors="replace")
         if exc.code == 403 and "awselb" in str(exc.headers).lower():
             raise AnalysisError(

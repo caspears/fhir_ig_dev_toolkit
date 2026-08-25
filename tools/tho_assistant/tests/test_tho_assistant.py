@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -202,6 +203,30 @@ class AnalyzerTests(unittest.TestCase):
             cookie="JSESSIONID=session",
         )
         self.assertEqual(result, expected)
+
+    def test_unauthorized_jira_response_hides_html_and_explains_cookie(self):
+        html = b"<html><head><title>Unauthorized (401)</title></head></html>"
+        unauthorized = tho_assistant.error.HTTPError(
+            "https://jira.hl7.org/rest/api/2/search",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(html),
+        )
+        with mock.patch.object(
+            tho_assistant.request, "urlopen", side_effect=unauthorized
+        ):
+            with self.assertRaises(tho_assistant.AnalysisError) as caught:
+                tho_assistant.search_jira_proposals(
+                    "https://jira.hl7.org",
+                    "project=UP",
+                    cookie="JSESSIONID=expired",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("cookie may have expired", message)
+        self.assertIn("HL7_JIRA_COOKIE", message)
+        self.assertNotIn("<html>", message)
 
     def test_xml_input(self):
         xml = """<CodeSystem xmlns=\"http://hl7.org/fhir\">

@@ -79,7 +79,9 @@ python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
 
 `HL7_JIRA_PAT` remains supported for Jira deployments whose front end permits
 Bearer authentication. If both variables are present, the browser cookie is
-used. Browser sessions expire, so the cookie may need to be refreshed.
+used. Browser sessions expire, so the cookie may need to be refreshed. An HTTP
+401 produces a concise instruction to verify or update `HL7_JIRA_COOKIE`; the
+Jira HTML login response is not printed.
 
 ## Current limitations
 
