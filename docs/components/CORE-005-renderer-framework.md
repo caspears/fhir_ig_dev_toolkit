@@ -92,6 +92,9 @@ Define the initial renderer target for the first implementation, likely PlantUML
 
 ## Notes
 
+The Common Graph Model is the initial and primary prepared toolkit model expected to be consumed by the Renderer Framework. Future phases may introduce additional prepared models for documentation, reporting, validation, or analysis.
+
+
 The Renderer Framework answers the question:
 
 > "How can toolkit models be transformed into useful output formats without coupling rendering logic to artifact loading, indexing, or relationship discovery?"

@@ -6,6 +6,11 @@ A suite of tools that assist FHIR Implementation Guide authors and standards dev
 
 PurposeA suite of tools that assist FHIR Implementation Guide authors and standards developers in understanding, authoring, validating, documenting, visualizing, maturing, and maintaining FHIR Implementation Guides throughout their lifecycle.
 
+## Guiding Principles
+### Model-Driven Architecture
+
+The toolkit is built around a series of shared semantic models. Components communicate through well-defined models rather than through implementation-specific representations. This promotes reuse, extensibility, and separation of concerns while enabling multiple downstream capabilities—such as visualization, analysis, documentation, validation, and future tooling—to operate on common representations.
+
 ## Scope
 
 The toolkit is intended to support the development and maintenance of FHIR Implementation Guides and related standards artifacts.
@@ -53,6 +58,16 @@ Examples:
 - Plugin framework (eventually)
 
 Without these, every later phase ends up duplicating code.
+
+
+### Phase 0.5 – Core Models
+
+The deliverables would be:
+
+- MODEL-001 – Artifact Model
+- MODEL-002 – Artifact Index Model
+- MODEL-003 – Relationship Model
+- MODEL-004 – Common Graph Model
 
 ### Phase 1 - Relationship Engine (Foundation) - Discover Relationships
 
