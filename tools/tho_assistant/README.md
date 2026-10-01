@@ -1,5 +1,91 @@
 # THO Proposal Assistant
 
+## Context-derived THO discovery
+
+With `--tho-package-dir`, THO CodeSystems discovered via ValueSet co-inclusion
+or resolved base bindings are inspected even without Jira matches. Discovery
+evidence, artifact version, and exact-code comparisons appear in JSON and Markdown.
+These canonical URLs also enter the Jira search, and canonical-only related
+results are retained. Inspection currently uses exact-code lookup; absence does
+not exclude synonyms or equivalent concepts under different identifiers.
+
+Automatic review files now add `target-system-suitability` decisions with a null
+proposal. Confirming one selects a system for investigation, not a code mapping.
+The target_code is the identifier used for lookup. Recommendations request concept
+review in the selected system; they do not infer a need for a new code. Existing
+proposal-mapping decisions remain compatible. New entries append to review files.
+
+## Planned spelling review
+
+Implement spelling checks in the backend so CLI, JSON/Markdown, and a future UI
+share the same findings. Check code, display, and definition. Tokenize camelCase,
+PascalCase, kebab-case, snake_case, and acronym boundaries in identifiers; retain
+the original code and token locations. Support domain dictionaries and reviewed
+exceptions for medical terms, abbreviations, and terminology identifiers. The UI
+will show suggestions and allow accept/dismiss decisions. Never automatically
+rename codes, especially published identifiers. Spelling review is planned,
+not implemented in this increment.
+
+## Recommendations and next milestones
+
+Every CLI analysis now includes recommended next actions in JSON and Markdown.
+Current confirmed review decisions support coordination with their existing
+proposals. Changed or unavailable evidence requires re-review; competing confirmed
+targets require resolution. Unreviewed or rejected mappings do not support a
+reuse recommendation. No-match results never automatically recommend a new code.
+Publication readiness remains a separate check against the intended THO release.
+
+Next milestones: pilot a second CodeSystem, then add a small local browser UI
+for selecting inputs, reviewing evidence, confirming/rejecting mappings, and
+viewing recommendations. JSON remains the persistence format, not the intended
+end-user editing experience. Reviewed proposal/questionnaire generation follows.
+
+## Saved review decisions
+
+Every analysis automatically creates or reuses `review-decisions.json` inside
+`--output-dir`. Read the report, change applicable `pending` decisions to
+`confirmed` or `rejected`, optionally add a note, save, and rerun the same command.
+Keep identities and `reviewed_evidence` unchanged during initial confirmation.
+New mappings are appended as pending; old decisions, notes, and reviewed baselines
+are retained. A backup is created before appending to an existing file. If no new
+mappings are present, the review file is not rewritten.
+
+Changed candidate/proposed text triggers `requires-re-review`; missing evidence
+produces `evidence-unavailable`. Compare changed evidence with the saved baseline
+before deliberately updating that baseline and reconfirming. Jira status alone
+does not invalidate mappings. Use a separate output directory per CodeSystem.
+Do not clear the review file between runs; back it up if build output is cleaned.
+
+`--review-file` remains an optional location override. To migrate an existing
+file stored elsewhere, retain the override or move the file into the output
+directory as `review-decisions.json`. The tool does not search other directories.
+`--write-review-template` is deprecated and acts as a custom review-path alias.
+Review entries currently require extracted proposal text and THO comparisons;
+an empty file means no reviewable mappings were extracted yet.
+
+Cookie input accepts a bare session value, `JSESSIONID=value`, or a complete
+Cookie header. Matching outer straight quotes and spaces around `=` are
+normalized. Control/non-ASCII characters and invalid cookie syntax are rejected
+locally without echoing credentials. HTTP 400 diagnostics distinguish structured
+Jira validation errors, explicit malformed-cookie responses, and unknown request
+failures; they do not assume expiration or print server response bodies.
+
+The extractor retains all supported proposal rows. When a candidate code has no
+exact row, a whole-term mention in another row's display identifies an alternate
+code candidate. Unique alternatives are compared with that target code in THO
+and marked `requires-review`; multiple alternatives remain ambiguous. No mapping
+is automatically confirmed. `code_mention_coverage` explicitly describes ticket
+mentions; the older `code_coverage` field remains for compatibility.
+
+Three-way comparison now includes explicit proposed concept rows from Jira
+`description` or HL7's `customfield_10426` proposal field. This initial extractor
+supports unindented code lines followed by tab-indented displays and double-tab
+indented definitions, as seen in the supplied UP-814 export. Other formats are
+reported as `not-extracted`; conflicting rows are `ambiguous`. Source field,
+line, and excerpt are retained in JSON, with field and line references in Markdown.
+Changes are inferred against the installed package, not asserted as Jira actions.
+This does not establish semantic equivalence or authorize a new proposal.
+
 This directory contains a small local MVP for preparing IG-owned terminology
 for an HL7 Terminology (THO) proposal.
 

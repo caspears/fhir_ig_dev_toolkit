@@ -3,19 +3,20 @@ To run working with Jira, Authentication will have to be established,
 
 Open browser Developer Tools
 Open the Network tab.
-Visit https://jira.hl7.org/rest/api/2/myself
+Visit https://jira.hl7.org/rest/api/2/myself (If the session is expired, may need a refresh. If the token doesn't change, may need to run in a new incognito tab)
 Select the myself request.
-Under Request Headers, copy the complete JSESSIONID Cookie value (including "JSESSION=").
+Under Request Headers, copy the complete JSESSIONID Cookie value (including "JSESSION="). If that doesn't work, try without JSESSIONID=
 Set it in PowerShell:
     `$env:HL7_JIRA_COOKIE = "JSESSIONID={value}"`
 
 Then run tool
+Use a different output directory (or clear out the current one) if you want to start fresh.
 ```shell
 python tools/tho_assistant/tho_assistant.py analyze `                                                                                    
    tools/tho_assistant/tests/fixtures/formulary/CodeSystem-usdf-BenefitCostTypeCS-TEMPORARY-TRIAL-USE.json `
    --ig-dir C:/dev/fhir/ig/davinci/davinci-pdex-formulary/output `
    --search-proposals `
-   --output-dir build/tho-analysis
+   --output-dir build/tho-analysis/BenefitCostTypeCS
 ```
 
 
@@ -42,7 +43,7 @@ python tools/tho_assistant/tho_assistant.py analyze `
   --ig-dir C:/dev/fhir/ig/davinci/davinci-pdex-formulary/output `
   --fhir-package-dir ~/.fhir/packages/hl7.fhir.r4.core#4.0.1 `
   --search-proposals `
-  --output-dir build/tho-analysis
+  --output-dir build/tho-analysis/BenefitCostTypeCS
 ```
 
 
@@ -55,5 +56,20 @@ python tools/tho_assistant/tho_assistant.py analyze `
   --fhir-package-dir ~/.fhir/packages/hl7.fhir.r4.core#4.0.1 `
   --tho-package-dir ~/.fhir/packages/hl7.terminology.r4 `
   --search-proposals `
-  --output-dir build/tho-analysis
+  --output-dir build/tho-analysis/BenefitCostTypeCS
 ```
+
+
+With added review template 
+
+
+```shell
+python tools/tho_assistant/tho_assistant.py analyze `
+  tools/tho_assistant/tests/fixtures/formulary/CodeSystem-usdf-BenefitCostTypeCS-TEMPORARY-TRIAL-USE.json `
+  --ig-dir C:/dev/fhir/ig/davinci/davinci-pdex-formulary/output `
+  --fhir-package-dir ~/.fhir/packages/hl7.fhir.r4.core#4.0.1 `
+  --tho-package-dir ~/.fhir/packages/hl7.terminology.r4 `
+  --search-proposals `
+  --output-dir build/tho-analysis/BenefitCostTypeCS
+```
+After updating the review file, run again the same way.

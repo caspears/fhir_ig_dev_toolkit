@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -583,10 +584,15 @@ def compare_tho_target_artifacts(
                 }
                 concept_results: list[dict[str, Any]] = []
                 for code, candidate in candidate_by_code.items():
-                    target = target_concepts.get(code)
+                    proposed = next((row for row in proposal.get("proposed_concepts", [])
+                                     if row["code"] == code), {})
+                    target_code = proposed.get("proposed_code", code)
+                    target = target_concepts.get(target_code)
                     concept_results.append(
                         {
                             "code": code,
+                            "target_code": target_code,
+                            "mapping_status": proposed.get("mapping_status", "unresolved"),
                             "status": "existing-code" if target else "absent-code",
                             "candidate_display": candidate.get("display"),
                             "target_display": target.get("display") if target else None,
@@ -607,6 +613,23 @@ def compare_tho_target_artifacts(
                 result["included_code_systems"] = _valueset_code_systems(artifact)
             artifacts.append(result)
         proposal["tho_target_artifacts"] = artifacts
+        proposed_by_code = {row["code"]: row for row in proposal.get("proposed_concepts", [])}
+        for artifact in artifacts:
+            for row in artifact.get("concept_comparison", []):
+                proposed = proposed_by_code.get(row["code"], {})
+                row["proposal_status"] = proposed.get("status", "not-extracted")
+                row["proposed_display"] = proposed.get("display")
+                row["proposed_definition"] = proposed.get("definition")
+                row["inferred_change"] = "manual-review"
+                if proposed.get("status") in {"extracted", "alternate-code-candidate"}:
+                    row["candidate_proposed_definition_comparison"] = _text_comparison(
+                        row.get("candidate_definition"), proposed["definition"])
+                    if row["status"] == "absent-code":
+                        row["inferred_change"] = "add-code-relative-to-package"
+                    else:
+                        changes = [field for field in ("display", "definition")
+                                   if row.get("target_" + field) != proposed[field]]
+                        row["inferred_change"] = "change-" + "-and-".join(changes) if changes else "no-text-change"
     return compared
 
 
@@ -699,7 +722,23 @@ def _jql_text(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def build_proposal_jql(resource: dict[str, Any], usages: list[dict[str, Any]]) -> str:
+def discover_context_targets(usages: list[dict[str, Any]], bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    targets: dict[str, list[dict[str, Any]]] = {}
+    for usage in usages:
+        for system in usage.get("tho_code_systems", []):
+            targets.setdefault(system, []).append({"source": "ValueSet co-inclusion", "value_set": usage.get("url")})
+    for profile in bindings:
+        for binding in profile.get("bindings", []):
+            base = binding.get("base_fhir_comparison") or {}
+            for system in (base.get("base_value_set_details") or {}).get("code_systems", []):
+                if system.startswith("http://terminology.hl7.org/CodeSystem/"):
+                    targets.setdefault(system, []).append({"source": "base FHIR binding", "profile": profile.get("url"),
+                        "element": binding.get("path"), "value_set": base.get("base_value_set")})
+    return [{"canonical": canonical, "evidence": evidence} for canonical, evidence in sorted(targets.items())]
+
+
+def build_proposal_jql(resource: dict[str, Any], usages: list[dict[str, Any]],
+                       bindings: list[dict[str, Any]] | None = None) -> str:
     terms: list[str] = []
     for value in (resource.get("url"), resource.get("name"), resource.get("title")):
         if isinstance(value, str) and value.strip():
@@ -717,6 +756,7 @@ def build_proposal_jql(resource: dict[str, Any], usages: list[dict[str, Any]]) -
             value = usage.get(field)
             if isinstance(value, str) and value.strip():
                 terms.append(value.strip())
+    terms.extend(target["canonical"] for target in discover_context_targets(usages, bindings or []))
     clauses = [
         f'text ~ "{_jql_text(term)}"' for term in dict.fromkeys(terms)
     ]
@@ -730,6 +770,7 @@ def search_jira_proposals(
     cookie: str | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
+    cookie = normalize_jira_cookie(cookie)
     if not token and not cookie:
         raise AnalysisError("Jira search requires a PAT or browser-session cookie")
     query = parse.urlencode(
@@ -762,12 +803,20 @@ def search_jira_proposals(
                 "The cookie may have expired; please verify and/or update "
                 "HL7_JIRA_COOKIE."
             ) from exc
-        if exc.code == 400 and cookie:
+        if exc.code == 400:
+            body = exc.read(16384).decode("utf-8", errors="replace")
+            try:
+                problem = json.loads(body)
+            except json.JSONDecodeError:
+                problem = None
+            if isinstance(problem, dict) and ("errorMessages" in problem or "errors" in problem):
+                reason = "Jira reported a query or request-validation error. Check the JQL and project access."
+            elif re.search(r"(?:invalid|malformed)[^\n]{0,100}cookie|cookie[^\n]{0,100}(?:invalid|malformed)", body, re.I):
+                reason = "The server reported malformed cookie syntax. Verify the copied Cookie header or use only the JSESSIONID value."
+            else:
+                reason = "The server rejected the request; the response does not establish a cookie or expiration problem."
             raise AnalysisError(
-                "HL7 Jira rejected the browser-session cookie (HTTP 400). "
-                "Enter either the JSESSIONID value by itself or a complete "
-                "Cookie header such as JSESSIONID=your-session-value. The "
-                "cookie may also have expired."
+                "HL7 Jira request failed (HTTP 400). " + reason
             ) from exc
         detail = exc.read(500).decode("utf-8", errors="replace")
         if exc.code == 403 and "awselb" in str(exc.headers).lower():
@@ -938,6 +987,70 @@ def _proposal_context_alignment(
     }
 
 
+def extract_proposed_concepts(fields: dict[str, Any], codes: list[str] | None) -> list[dict[str, Any]]:
+    """Extract only explicit indented code/display/definition blocks.
+
+    Comments and user metadata are deliberately excluded. Multiple different
+    rows for a code remain ambiguous rather than selecting one silently.
+    """
+    if codes is None:
+        codes = sorted({line for field in ("description", "customfield_10426")
+                        for line in str(fields.get(field) or "").splitlines()
+                        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", line)})
+        return [row for row in extract_proposed_concepts(fields, codes)
+                if row["status"] != "not-extracted"]
+    results = []
+    for code in codes:
+        rows = []
+        for field, value in fields.items():
+            if field != "description" and field != "customfield_10426":
+                continue
+            if not isinstance(value, str):
+                continue
+            lines = value.splitlines()
+            for index, line in enumerate(lines[:-2]):
+                if line.strip() != code or line != line.lstrip():
+                    continue
+                display, definition = lines[index + 1:index + 3]
+                if not display.startswith("\t") or display.startswith("\t\t"):
+                    continue
+                if not definition.startswith("\t\t"):
+                    continue
+                if not display.strip() or not definition.strip():
+                    continue
+                rows.append({"display": display.strip(), "definition": definition.strip(),
+                             "source_field": field, "source_line": index + 1,
+                             "source_excerpt": "\n".join(lines[index:index + 3])})
+        distinct = {(row["display"], row["definition"]) for row in rows}
+        result = {"code": code, "status": "extracted" if len(distinct) == 1 else
+                  "ambiguous" if distinct else "not-extracted", "evidence": rows}
+        if len(distinct) == 1:
+            result.update(display=rows[0]["display"], definition=rows[0]["definition"],
+                          proposed_code=code, mapping_status="exact-code")
+        results.append(result)
+    return results
+
+
+def map_proposed_concepts(fields: dict[str, Any], codes: list[str]) -> list[dict[str, Any]]:
+    all_rows = extract_proposed_concepts(fields, None)
+    results = extract_proposed_concepts(fields, codes)
+    for result in results:
+        if result["status"] != "not-extracted":
+            continue
+        # A display mention is a discovery signal, not proof of equivalence.
+        candidates = [row for row in all_rows if row["status"] == "extracted"
+                      and _mentioned_terms([result["code"]], row["display"])]
+        result["alternate_candidates"] = candidates
+        if len(candidates) == 1:
+            row = candidates[0]
+            result.update(status="alternate-code-candidate", proposed_code=row["code"],
+                          display=row["display"], definition=row["definition"],
+                          evidence=row["evidence"], mapping_status="requires-review")
+        elif candidates:
+            result.update(status="ambiguous", mapping_status="requires-review")
+    return results
+
+
 def match_proposals(
     resource: dict[str, Any],
     concepts: list[dict[str, Any]],
@@ -964,6 +1077,8 @@ def match_proposals(
         for value in (resource.get("url"), *(usage.get("url") for usage in (valueset_usage or [])))
         if isinstance(value, str) and value
     }
+    context_canonicals = {target["canonical"] for target in
+                         discover_context_targets(valueset_usage or [], binding_context or [])}
     matches: list[dict[str, Any]] = []
     for payload in proposal_payloads:
         for issue in _jira_issues(payload):
@@ -988,7 +1103,8 @@ def match_proposals(
             matched_local_canonicals = sorted(
                 canonical for canonical in local_canonicals if canonical in searchable_text
             )
-            if not mentioned_codes and not matched_terms and not matched_local_canonicals:
+            matched_context_canonicals = sorted(context_canonicals.intersection(canonicals))
+            if not mentioned_codes and not matched_terms and not matched_local_canonicals and not matched_context_canonicals:
                 continue
             if candidate_codes and len(mentioned_codes) == len(candidate_codes):
                 coverage = "full"
@@ -1029,6 +1145,9 @@ def match_proposals(
                         else resolution
                     ),
                     "coverage": coverage,
+                    "proposed_concepts": map_proposed_concepts(fields, candidate_codes),
+                    "all_proposed_concepts": extract_proposed_concepts(fields, None),
+                    "code_mention_coverage": code_coverage,
                     "code_coverage": code_coverage,
                     "context_alignment": context["alignment"],
                     "context_score": context["score"],
@@ -1040,6 +1159,7 @@ def match_proposals(
                     "matched_terms": matched_terms,
                     "matched_local_canonicals": matched_local_canonicals,
                     "target_canonicals": canonicals,
+                    "matched_context_canonicals": matched_context_canonicals,
                 }
             )
     alignment_rank = {"high": 0, "moderate": 1, "unknown": 2, "low": 3}
@@ -1088,6 +1208,13 @@ def analyze(
         result["valueset_usage"] = valueset_usage
     if binding_context is not None:
         result["binding_context"] = binding_context
+    if tho_package_dir is not None:
+        targets = discover_context_targets(valueset_usage or [], binding_context or [])
+        inspected = compare_tho_target_artifacts(
+            [{"target_canonicals": [target["canonical"]]} for target in targets], concepts, tho_package_dir)
+        result["context_target_artifacts"] = [
+            {**record["tho_target_artifacts"][0], "discovery_evidence": target["evidence"]}
+            for target, record in zip(targets, inspected)]
     return result
 
 
@@ -1095,6 +1222,150 @@ def _escape_table(value: Any) -> str:
     if value is None:
         return ""
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def build_review_template(analysis: dict[str, Any]) -> dict[str, Any]:
+    decisions = []
+    for proposal in analysis.get("proposal_matches", []):
+        for artifact in proposal.get("tho_target_artifacts", []):
+            for row in artifact.get("concept_comparison", []):
+                if not row.get("proposed_definition"):
+                    continue
+                decisions.append({
+                    "proposal": proposal["key"], "source_code": row["code"],
+                    "target_system": artifact["canonical"], "target_code": row["target_code"],
+                    "decision": "pending", "note": "",
+                    "reviewed_evidence": {key: row.get(key) for key in (
+                        "candidate_display", "candidate_definition", "proposed_display", "proposed_definition")},
+                })
+    for artifact in analysis.get("context_target_artifacts", []):
+        if artifact.get("status") != "found":
+            continue
+        for row in artifact.get("concept_comparison", []):
+            decisions.append({"proposal": None, "decision_kind": "target-system-suitability",
+                "source_code": row["code"], "target_system": artifact["canonical"],
+                "target_code": row["code"], "decision": "pending", "note": "Confirm system suitability only; this does not confirm code equivalence or authorize a new code.",
+                "reviewed_evidence": {**{key: row.get(key) for key in
+                    ("candidate_display", "candidate_definition", "target_display", "target_definition", "status")},
+                    "discovery_evidence": artifact.get("discovery_evidence")}})
+    return {"schema_version": "1.0", "source_system": analysis["metadata"].get("url"),
+            "decisions": decisions}
+
+
+def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> None:
+    if review.get("schema_version") != "1.0" or review.get("source_system") != analysis["metadata"].get("url"):
+        raise AnalysisError("Review file schema or source CodeSystem does not match this analysis. Use a separate output directory or the correct --review-file; existing decisions are preserved.")
+    if not isinstance(review.get("decisions"), list):
+        raise AnalysisError("Review file decisions must be an array.")
+    current = build_review_template(analysis)["decisions"]
+    results = []
+    seen = set()
+    for decision in review["decisions"]:
+        if not isinstance(decision, dict) or decision.get("decision") not in {"pending", "confirmed", "rejected"}:
+            raise AnalysisError("Each review decision must be pending, confirmed, or rejected.")
+        identity = tuple(decision.get(key) for key in ("proposal", "source_code", "target_system", "target_code"))
+        valid_proposal = isinstance(identity[0], str) and bool(identity[0]) or (
+            identity[0] is None and decision.get("decision_kind") == "target-system-suitability")
+        if not valid_proposal or not all(isinstance(value, str) and value for value in identity[1:]) or identity in seen:
+            raise AnalysisError("Review decisions require unique proposal/source/target identities.")
+        seen.add(identity)
+        matching = [row for row in current if tuple(row[key] for key in
+                    ("proposal", "source_code", "target_system", "target_code")) == identity]
+        status = decision["decision"]
+        if not matching:
+            status = "evidence-unavailable"
+        elif (decision.get("reviewed_evidence") != matching[0]["reviewed_evidence"] or
+              decision.get("decision_kind") != matching[0].get("decision_kind")):
+            status = "requires-re-review"
+        results.append({**decision, "effective_status": status})
+    analysis["review_decisions"] = results
+
+
+def maintain_review_file(analysis: dict[str, Any], path: Path) -> tuple[bool, int]:
+    """Preserve human decisions and their baseline; append only new identities."""
+    exists = path.exists()
+    original = path.read_text(encoding="utf-8-sig") if exists else None
+    try:
+        review = json.loads(original) if exists else build_review_template(analysis)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError("Review file is invalid JSON; it has not been overwritten.") from exc
+    if not isinstance(review, dict):
+        raise AnalysisError("Review file must contain a JSON object.")
+    # Validate before modifying any existing file.
+    apply_review_decisions(analysis, review)
+    keys = ("proposal", "source_code", "target_system", "target_code")
+    identities = {tuple(row[key] for key in keys) for row in review["decisions"]}
+    additions = [row for row in build_review_template(analysis)["decisions"]
+                 if tuple(row[key] for key in keys) not in identities] if exists else []
+    review["decisions"].extend(additions)
+    if not exists or additions:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(review, indent=2, ensure_ascii=False) + "\n"
+        if not exists:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(content)
+        else:
+            # Preserve a pre-update copy and avoid partially written decision files.
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=path.name + ".backup-", delete=False) as backup:
+                backup.write(original)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=path.name + ".tmp-", delete=False) as handle:
+                handle.write(content)
+                temporary = Path(handle.name)
+            if path.read_text(encoding="utf-8-sig") != original:
+                temporary.unlink()
+                raise AnalysisError("Review file changed during analysis; rerun to preserve your edits.")
+            os.replace(temporary, path)
+    apply_review_decisions(analysis, review)
+    return not exists, len(additions)
+
+
+def build_recommendations(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recommend next review actions without inferring publication or equivalence."""
+    results = []
+    decisions = analysis.get("review_decisions", [])
+    for concept in analysis.get("concepts", []):
+        code = concept.get("code")
+        reviews = [row for row in decisions if row.get("source_code") == code]
+        confirmed = [row for row in reviews if row.get("effective_status") == "confirmed"]
+        targets = {(row["target_system"], row["target_code"]) for row in confirmed}
+        if len(targets) > 1:
+            action = "resolve-conflicting-decisions"
+            reason = "More than one target mapping is confirmed; choose the applicable target before proceeding."
+        elif confirmed:
+            if any(row.get("proposal") for row in confirmed):
+                action = "coordinate-with-existing-proposal"
+                reason = "A current human review confirms this mapping. Coordinate with the associated proposal before preparing a duplicate."
+            else:
+                action = "review-concepts-in-selected-system"
+                reason = "Target system suitability is confirmed. Review existing concepts and related proposals before deciding on reuse or additions. No code mapping is confirmed by this decision."
+        elif any(row.get("effective_status") in {"requires-re-review", "evidence-unavailable"} for row in reviews):
+            action = "re-review-evidence"
+            reason = "Saved decisions have changed or unavailable evidence and cannot support a current recommendation."
+        else:
+            action = "review-candidates"
+            reason = "No current confirmed mapping is available. Review candidates or broaden terminology discovery; absence of a match does not establish a need for a new code."
+        refs = []
+        for decision in confirmed:
+            if decision.get("decision_kind") == "target-system-suitability":
+                continue
+            proposal = next((row for row in analysis.get("proposal_matches", [])
+                             if row.get("key") == decision["proposal"]), {})
+            artifact = next((row for row in proposal.get("tho_target_artifacts", [])
+                             if row.get("canonical") == decision["target_system"]), {})
+            comparison = next((row for row in artifact.get("concept_comparison", [])
+                               if row.get("code") == code and row.get("target_code") == decision["target_code"]), {})
+            refs.append({"proposal": decision["proposal"], "proposal_status": proposal.get("status"),
+                         "proposal_resolution": proposal.get("resolution"),
+                         "target_system": decision["target_system"], "target_code": decision["target_code"],
+                         "installed_code_status": comparison.get("status"),
+                         "proposed_change": comparison.get("inferred_change")})
+        results.append({"source_code": code, "action": action, "reason": reason,
+                        "confirmed_evidence": refs,
+                        "publication_readiness": "not-established",
+                        "publication_check": "Verify the required target display and definition in the intended published THO version before updating the IG. Jira status and confirmed mappings alone do not establish publication readiness."})
+    return results
 
 
 def render_markdown(analysis: dict[str, Any]) -> str:
@@ -1119,13 +1390,52 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             "and governance review are still required."
         )
 
+    if "recommendations" in analysis:
+        lines.extend(["", "## Recommended next actions", "",
+                      "| Candidate code | Action | Reason |", "|---|---|---|"])
+        for recommendation in analysis["recommendations"]:
+            lines.append("| " + " | ".join(_escape_table(recommendation[key]) for key in
+                         ("source_code", "action", "reason")) + " |")
+        for recommendation in analysis["recommendations"]:
+            for evidence in recommendation["confirmed_evidence"]:
+                lines.extend(["", f"- `{recommendation['source_code']}` → `{evidence['target_system']}#{evidence['target_code']}`: "
+                              f"{evidence['proposal']} ({evidence.get('proposal_status')}); "
+                              f"installed target: {evidence.get('installed_code_status')}; "
+                              f"proposed change: {evidence.get('proposed_change')}."])
+        lines.extend(["", "Publication readiness is not established. Verify the required target display and definition in the intended published THO version before updating the IG. Jira status and mapping confirmation alone are insufficient."])
+
+    if "context_target_artifacts" in analysis:
+        lines.extend(["", "## THO targets discovered from IG context", "",
+                      "These systems were inspected independently of Jira. Confirming system suitability does not confirm a code mapping or justify adding a code."])
+        for artifact in analysis["context_target_artifacts"]:
+            lines.extend(["", f"### {artifact['canonical']}", "",
+                          f"Package lookup: {artifact['status']}; artifact version: {artifact.get('version') or 'unknown'}."])
+            for evidence in artifact["discovery_evidence"]:
+                lines.append("- " + _escape_table("; ".join(f"{key}: {value}" for key, value in evidence.items())))
+            lines.extend(["", "| Candidate code | Exact-code lookup | Installed display | Installed definition |",
+                          "|---|---|---|---|"])
+            for row in artifact.get("concept_comparison", []):
+                lines.append("| " + " | ".join(_escape_table(row.get(key)) for key in
+                    ("code", "status", "target_display", "target_definition")) + " |")
+            lines.extend(["", "An absent exact code does not rule out an equivalent concept under another code."])
+
+    if "review_decisions" in analysis:
+        lines.extend(["", "## Saved review decisions", "",
+                      "Human decisions are separate from automated findings. Confirmed mappings do not imply THO publication.", "",
+                      "Target-system-suitability decisions select a system for investigation only. Their target_code is the candidate identifier used for exact lookup, not an approved mapping.", "",
+                      "| Decision kind | Proposal | Source code | Target system | Target code | Saved decision | Effective status | Note |",
+                      "|---|---|---|---|---|---|---|---|"])
+        for decision in analysis["review_decisions"]:
+            lines.append("| " + _escape_table(decision.get("decision_kind", "proposal-mapping")) + " | " + " | ".join(_escape_table(decision.get(key)) for key in
+                         ("proposal", "source_code", "target_system", "target_code", "decision", "effective_status", "note")) + " |")
+
     if "proposal_matches" in analysis:
         lines.extend(["", "## Related THO proposals", ""])
         proposals = analysis["proposal_matches"]
         if proposals:
             lines.extend(
                 [
-                    "| Proposal | Status | Code coverage | Context | Assessment | Context evidence | Target artifacts |",
+                    "| Proposal | Status | Code-mention coverage | Context | Assessment | Context evidence | Target artifacts |",
                     "|---|---|---|---|---|---|---|",
                 ]
             )
@@ -1197,8 +1507,17 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                 "This section describes the installed THO package. An open proposal "
                 "may contain changes that are not yet present in that package."
             )
+            lines.extend(["", "Changes below are inferred relative to the installed package, not explicit Jira actions. "
+                          "Extracted rows require human confirmation of target and proposal intent; textual differences do not establish semantic differences.", ""])
             for proposal in target_comparisons:
                 lines.extend(["", f"### {proposal.get('key')}", ""])
+                for proposed in proposal.get("proposed_concepts", []):
+                    lines.append(f"- Candidate `{proposed['code']}` → proposed "
+                                 f"`{proposed.get('proposed_code', 'unresolved')}`: "
+                                 f"{proposed.get('mapping_status', proposed['status'])}.")
+                    for evidence in proposed.get("evidence", []):
+                        lines.append(f"- Extraction evidence for `{proposed['code']}`: "
+                                     f"{evidence['source_field']}, line {evidence['source_line']}.")
                 for artifact in proposal.get("tho_target_artifacts", []):
                     lines.append(
                         f"- `{_escape_table(artifact.get('canonical'))}` "
@@ -1206,9 +1525,16 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                     )
                     if artifact.get("resource_type") == "CodeSystem" and artifact.get("status") == "found":
                         for concept in artifact.get("concept_comparison", []):
+                            lines.extend(["", f"#### Concept `{concept.get('code')}`", "",
+                                f"Installed THO comparison code: `{concept.get('target_code', concept.get('code'))}`; mapping: {concept.get('mapping_status')}.", "",
+                                "| Source | Display | Definition |", "|---|---|---|",
+                                "| IG | " + _escape_table(concept.get("candidate_display")) + " | " + _escape_table(concept.get("candidate_definition")) + " |",
+                                "| Installed THO | " + _escape_table(concept.get("target_display")) + " | " + _escape_table(concept.get("target_definition")) + " |",
+                                "| Jira proposal | " + _escape_table(concept.get("proposed_display")) + " | " + _escape_table(concept.get("proposed_definition")) + " |", "",
+                                f"Extraction: {concept.get('proposal_status')}; inferred change: {concept.get('inferred_change')}.", ""])
                             lines.append(
                                 "  - "
-                                f"`{_escape_table(concept.get('code'))}`: "
+                                f"Candidate `{_escape_table(concept.get('code'))}` → target `{_escape_table(concept.get('target_code'))}`: "
                                 f"{concept.get('status')}; "
                                 f"display={concept.get('display_comparison')}; "
                                 f"definition={concept.get('definition_comparison')}"
@@ -1304,16 +1630,34 @@ def normalize_jira_cookie(cookie: str | None) -> str | None:
     """Accept either a bare JSESSIONID or a complete browser Cookie value."""
     if cookie is None:
         return None
+    # Reject hidden/control characters before stripping or constructing headers.
+    if any(ord(char) < 32 or ord(char) > 126 for char in cookie):
+        raise AnalysisError("The Jira cookie contains control or non-ASCII characters. Copy a single plain-text cookie value.")
     cookie = cookie.strip()
+    if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in "\"'":
+        cookie = cookie[1:-1].strip()
     if cookie.lower().startswith("cookie:"):
         cookie = cookie.split(":", 1)[1].strip()
     if not cookie:
         return None
-    if "\r" in cookie or "\n" in cookie:
-        raise AnalysisError("The Jira cookie must be entered on a single line.")
     if "=" not in cookie:
-        return f"JSESSIONID={cookie}"
-    return cookie
+        cookie = f"JSESSIONID={cookie}"
+    parts = []
+    for part in cookie.split(";"):
+        if not part.strip():
+            continue
+        name, separator, value = part.partition("=")
+        name, value = name.strip(), value.strip()
+        if not separator or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise AnalysisError("Invalid Cookie header syntax. Enter a bare JSESSIONID value or name=value cookie pairs.")
+        if name == "JSESSION":
+            raise AnalysisError("The Jira session cookie name is JSESSIONID, not JSESSION.")
+        if name == "JSESSIONID" and not value:
+            raise AnalysisError("The JSESSIONID value is empty.")
+        if not re.fullmatch(r'[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*', value):
+            raise AnalysisError("Invalid cookie value characters. Remove pasted quotes or embedded whitespace.")
+        parts.append(f"{name}={value}")
+    return "; ".join(parts)
 
 
 def get_jira_credentials() -> tuple[str | None, str | None]:
@@ -1378,7 +1722,7 @@ def command_analyze(args: argparse.Namespace) -> int:
             binding_context, args.fhir_package_dir.expanduser().resolve()
         )
     if args.search_proposals:
-        jql = build_proposal_jql(resource, valueset_usage or [])
+        jql = build_proposal_jql(resource, valueset_usage or [], binding_context or [])
         proposal_payloads.append(
             search_jira_proposals(
                 args.jira_url, jql, token=token, cookie=cookie
@@ -1404,6 +1748,14 @@ def command_analyze(args: argparse.Namespace) -> int:
         tho_package_dir,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.review_file and args.write_review_template:
+        raise AnalysisError("Use --review-file alone; --write-review-template is deprecated.")
+    review_path = (args.review_file or args.write_review_template or
+                   (output_dir / "review-decisions.json")).expanduser().resolve()
+    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", source}:
+        raise AnalysisError("The review file must be separate from the input and generated reports.")
+    created, added = maintain_review_file(result, review_path)
+    result["recommendations"] = build_recommendations(result)
     (output_dir / "analysis.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -1413,6 +1765,21 @@ def command_analyze(args: argparse.Namespace) -> int:
     print(f"Analyzed {result['concept_count']} concepts from {source}")
     print(f"Wrote {output_dir / 'analysis.json'}")
     print(f"Wrote {output_dir / 'concept-inventory.md'}")
+    print(f"Review file {'created' if created else 'reused'}: {review_path}")
+    if added:
+        print(f"Added {added} pending mappings; existing decisions and reviewed evidence preserved.")
+    counts: dict[str, int] = {}
+    for decision in result["review_decisions"]:
+        status = decision["effective_status"]
+        counts[status] = counts.get(status, 0) + 1
+    print("Review status: " + (", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "no extracted mappings available"))
+    print("Next: Review concept-inventory.md. Set applicable pending decisions to confirmed or rejected; optionally add a note.")
+    print("Preserve mapping identities and reviewed_evidence. Save the review file and rerun the same command.")
+    if counts.get("requires-re-review"):
+        print("Changed evidence: compare current findings with the saved baseline before updating reviewed_evidence and reconfirming.")
+    print("Keep the review file between runs. Use a separate output directory for each CodeSystem.")
+    if args.write_review_template:
+        print("--write-review-template is deprecated; use --review-file for this custom path on subsequent runs.")
     return 0
 
 
@@ -1431,6 +1798,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test_parser.set_defaults(handler=command_test_jira)
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a candidate CodeSystem")
+    analyze_parser.add_argument("--review-file", type=Path, help="Override the automatic output-dir/review-decisions.json path")
+    analyze_parser.add_argument("--write-review-template", type=Path, help="Deprecated alias for a custom review-file path")
     analyze_parser.add_argument("input", type=Path, help="FHIR CodeSystem JSON or XML")
     analyze_parser.add_argument("--output-dir", type=Path, required=True, help="Directory for generated analysis")
     analyze_parser.add_argument(

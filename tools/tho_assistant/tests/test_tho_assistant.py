@@ -15,6 +15,123 @@ SPEC.loader.exec_module(tho_assistant)
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_context_discovery_without_jira_supports_system_review(self):
+        canonical = "http://terminology.hl7.org/CodeSystem/contactentity-type"
+        resource = {"resourceType": "CodeSystem", "url": "urn:local", "concept": [
+            {"code": "MARKETING", "display": "Marketing", "definition": "Plan marketing contact."}]}
+        usages = [{"url": "urn:vs", "tho_code_systems": [canonical]}]
+        bindings = [{"url": "urn:profile", "bindings": [{"path": "InsurancePlan.contact.purpose",
+            "base_fhir_comparison": {"base_value_set": "urn:base-vs", "base_value_set_details": {"code_systems": [canonical]}}}]}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "CodeSystem-contactentity-type.json").write_text(json.dumps({
+                "resourceType": "CodeSystem", "url": canonical, "concept": [{"code": "ADMIN"}]
+            }), encoding="utf-8")
+            result = tho_assistant.analyze(resource, Path("input.json"), [], usages, bindings, path)
+            artifact = result["context_target_artifacts"][0]
+            self.assertEqual(len(artifact["discovery_evidence"]), 2)
+            self.assertEqual(artifact["concept_comparison"][0]["status"], "absent-code")
+            review = tho_assistant.build_review_template(result)
+            self.assertEqual(review["decisions"][0]["proposal"], None)
+            review["decisions"][0]["decision"] = "confirmed"
+            tho_assistant.apply_review_decisions(result, review)
+            self.assertEqual(tho_assistant.build_recommendations(result)[0]["action"], "review-concepts-in-selected-system")
+            self.assertIn("THO targets discovered from IG context", tho_assistant.render_markdown(result))
+        self.assertIn(canonical, tho_assistant.build_proposal_jql(resource, usages, bindings))
+        matches = tho_assistant.match_proposals(resource, resource["concept"], [{"key": "UP-context", "fields": {
+            "summary": "Contact terminology", "description": canonical}}], usages, bindings)
+        self.assertEqual(matches[0]["matched_context_canonicals"], [canonical])
+
+    def test_automatic_review_lifecycle(self):
+        analysis = {"metadata": {"url": "urn:source"}, "proposal_matches": [{
+            "key": "UP-test", "tho_target_artifacts": [{"canonical": "urn:target",
+            "concept_comparison": [{"code": "one", "target_code": "one", "proposed_definition": "Original"}]}]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "review.json"
+            self.assertEqual(tho_assistant.maintain_review_file(analysis, path), (True, 0))
+            review = json.loads(path.read_text())
+            review["decisions"][0].update(decision="confirmed", note="Reviewed")
+            path.write_text(json.dumps(review))
+            original = path.read_bytes()
+            self.assertEqual(tho_assistant.maintain_review_file(analysis, path), (False, 0))
+            self.assertEqual(path.read_bytes(), original)
+            rows = analysis["proposal_matches"][0]["tho_target_artifacts"][0]["concept_comparison"]
+            rows[0]["proposed_definition"] = "Changed"
+            rows.append({"code": "two", "target_code": "two", "proposed_definition": "New"})
+            self.assertEqual(tho_assistant.maintain_review_file(analysis, path), (False, 1))
+            updated = json.loads(path.read_text())
+            self.assertEqual(updated["decisions"][0], review["decisions"][0])
+            self.assertEqual(updated["decisions"][1]["decision"], "pending")
+            self.assertEqual(analysis["review_decisions"][0]["effective_status"], "requires-re-review")
+            before = path.read_bytes()
+            analysis["metadata"]["url"] = "urn:other"
+            with self.assertRaises(tho_assistant.AnalysisError):
+                tho_assistant.maintain_review_file(analysis, path)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_recommendations_require_current_confirmation(self):
+        analysis = {"concepts": [{"code": "coinsurance"}], "review_decisions": []}
+        self.assertEqual(tho_assistant.build_recommendations(analysis)[0]["action"], "review-candidates")
+        decision = {"source_code": "coinsurance", "target_code": "copay-percent",
+                    "target_system": "urn:benefit", "proposal": "UP-test", "effective_status": "confirmed"}
+        analysis["review_decisions"] = [decision]
+        result = tho_assistant.build_recommendations(analysis)[0]
+        self.assertEqual(result["action"], "coordinate-with-existing-proposal")
+        self.assertEqual(result["publication_readiness"], "not-established")
+        decision["effective_status"] = "requires-re-review"
+        self.assertEqual(tho_assistant.build_recommendations(analysis)[0]["action"], "re-review-evidence")
+        decision["effective_status"] = "rejected"
+        self.assertEqual(tho_assistant.build_recommendations(analysis)[0]["action"], "review-candidates")
+        decision["effective_status"] = "confirmed"
+        analysis["review_decisions"].append({**decision, "target_system": "urn:other"})
+        self.assertEqual(tho_assistant.build_recommendations(analysis)[0]["action"], "resolve-conflicting-decisions")
+
+    def test_review_decisions_expire_on_changed_evidence(self):
+        analysis = {"metadata": {"url": "urn:source"}, "proposal_matches": [{
+            "key": "UP-test", "tho_target_artifacts": [{"canonical": "urn:target",
+            "concept_comparison": [{"code": "source", "target_code": "target",
+                                    "proposed_definition": "Meaning"}]}]}]}
+        review = tho_assistant.build_review_template(analysis)
+        self.assertEqual(review["decisions"][0]["decision"], "pending")
+        review["decisions"][0]["decision"] = "confirmed"
+        tho_assistant.apply_review_decisions(analysis, review)
+        self.assertEqual(analysis["review_decisions"][0]["effective_status"], "confirmed")
+        analysis["proposal_matches"][0]["tho_target_artifacts"][0]["concept_comparison"][0]["proposed_definition"] = "Changed"
+        tho_assistant.apply_review_decisions(analysis, review)
+        self.assertEqual(analysis["review_decisions"][0]["effective_status"], "requires-re-review")
+        analysis["proposal_matches"] = []
+        tho_assistant.apply_review_decisions(analysis, review)
+        self.assertEqual(analysis["review_decisions"][0]["effective_status"], "evidence-unavailable")
+
+    def test_alternate_code_mapping_requires_review(self):
+        fields = {"customfield_10426": "copay-percent\n\tCopayment Percent / Coinsurance\n\t\tPercentage cost sharing, also referred to as coinsurance."}
+        row = tho_assistant.map_proposed_concepts(fields, ["coinsurance"])[0]
+        self.assertEqual(row["proposed_code"], "copay-percent")
+        self.assertEqual(row["mapping_status"], "requires-review")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "CodeSystem-test.json").write_text(json.dumps({
+                "resourceType": "CodeSystem", "url": "http://example.org/CodeSystem/test",
+                "concept": [{"code": "copay-percent", "display": "Percent", "definition": "A percentage."}]
+            }), encoding="utf-8")
+            result = tho_assistant.compare_tho_target_artifacts(
+                [{"target_canonicals": ["http://example.org/CodeSystem/test"], "proposed_concepts": [row]}],
+                [{"code": "coinsurance", "display": "Coinsurance"}], path)
+        comparison = result[0]["tho_target_artifacts"][0]["concept_comparison"][0]
+        self.assertEqual(comparison["status"], "existing-code")
+        self.assertEqual(comparison["target_code"], "copay-percent")
+        fields["description"] = "another\n\tCoinsurance\n\t\tAnother meaning."
+        self.assertEqual(tho_assistant.map_proposed_concepts(fields, ["coinsurance"])[0]["status"], "ambiguous")
+
+    def test_extracts_explicit_proposal_blocks_only(self):
+        fields = {"customfield_10426": "copay\n\tCopayment\n\t\tA fixed amount.\n\ncoinsurance mentioned only"}
+        rows = tho_assistant.extract_proposed_concepts(fields, ["copay", "coinsurance"])
+        self.assertEqual(rows[0]["definition"], "A fixed amount.")
+        self.assertEqual(rows[0]["evidence"][0]["source_field"], "customfield_10426")
+        self.assertEqual(rows[1]["status"], "not-extracted")
+        fields["description"] = "copay\n\tDifferent\n\t\tAnother definition."
+        self.assertEqual(tho_assistant.extract_proposed_concepts(fields, ["copay"])[0]["status"], "ambiguous")
+
     def setUp(self):
         self.fixture = Path(__file__).parent / "fixtures" / "CodeSystem-example.json"
         self.formulary_fixture = (
@@ -637,8 +754,27 @@ class AnalyzerTests(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("HTTP 400", message)
-        self.assertIn("JSESSIONID", message)
+        self.assertIn("does not establish", message)
         self.assertNotIn("<html>", message)
+
+    def test_cookie_input_normalization_and_rejection(self):
+        for value in ("example", "JSESSIONID=example", '"JSESSIONID=example"',
+                      "Cookie: JSESSIONID = example"):
+            self.assertEqual(tho_assistant.normalize_jira_cookie(value), "JSESSIONID=example")
+        for value in ("JSESSIONID=", "JSESSION=example", "JSESSIONID=secret\u200b",
+                      "JSESSIONID=secret\n", "JSESSIONID=sec ret"):
+            with self.assertRaises(tho_assistant.AnalysisError) as caught:
+                tho_assistant.normalize_jira_cookie(value)
+            self.assertNotIn("secret", str(caught.exception))
+
+    def test_json_400_does_not_blame_cookie_or_echo_server_data(self):
+        failure = tho_assistant.error.HTTPError("https://jira.hl7.org", 400, "Bad Request", {},
+            io.BytesIO(b'{"errorMessages":["secret-session query error"]}'))
+        with mock.patch.object(tho_assistant.request, "urlopen", side_effect=failure):
+            with self.assertRaises(tho_assistant.AnalysisError) as caught:
+                tho_assistant.search_jira_proposals("https://jira.hl7.org", "project=UP", cookie="example")
+        self.assertIn("query or request-validation", str(caught.exception))
+        self.assertNotIn("secret-session", str(caught.exception))
 
     def test_xml_input(self):
         xml = """<CodeSystem xmlns=\"http://hl7.org/fhir\">
