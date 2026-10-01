@@ -44,3 +44,16 @@ python tools/tho_assistant/tho_assistant.py analyze `
   --search-proposals `
   --output-dir build/tho-analysis
 ```
+
+
+
+Using a THO package
+```shell
+python tools/tho_assistant/tho_assistant.py analyze `
+  tools/tho_assistant/tests/fixtures/formulary/CodeSystem-usdf-BenefitCostTypeCS-TEMPORARY-TRIAL-USE.json `
+  --ig-dir C:/dev/fhir/ig/davinci/davinci-pdex-formulary/output `
+  --fhir-package-dir ~/.fhir/packages/hl7.fhir.r4.core#4.0.1 `
+  --tho-package-dir ~/.fhir/packages/hl7.terminology.r4 `
+  --search-proposals `
+  --output-dir build/tho-analysis
+```

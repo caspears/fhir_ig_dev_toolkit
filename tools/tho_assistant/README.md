@@ -27,9 +27,43 @@ python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
   --output-dir build/tho-analysis
 ```
 
-Proposal matching currently identifies exact code mentions and target HL7
-CodeSystem/ValueSet canonicals. A full match means all candidate codes were
-mentioned in the proposal; it does not mean their definitions are identical.
+Proposal matching identifies exact code mentions and target HL7
+CodeSystem/ValueSet canonicals. Code coverage is reported separately from
+context alignment. Context alignment uses explainable token overlap between the
+proposal targets and the discovered local ValueSet, profile element path, base
+element definition, and candidate metadata. It does not mean that definitions
+are semantically equivalent. The JSON and Markdown outputs show every context
+source, the exact IG binding, matched terms, weight, score contribution, and
+non-matching evidence. Binding strength is displayed but does not currently
+change the score.
+
+To inspect the actual CodeSystems and ValueSets targeted by matching proposals,
+provide an installed THO package:
+
+```bash
+python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
+  --ig-dir path/to/ig \
+  --tho-package-dir ~/.fhir/packages/hl7.terminology.r4#6.5.0 \
+  --search-proposals \
+  --output-dir build/tho-analysis
+```
+
+The report identifies whether each target artifact exists in that package,
+whether candidate codes already exist, display and definition differences, and
+the CodeSystems included by target ValueSets. The package is a snapshot; an
+open proposal may describe changes that are not present in the installed
+version.
+
+An unversioned package-family path automatically selects the highest installed
+semantic version and prints the resolved version and directory:
+
+```bash
+--tho-package-dir ~/.fhir/packages/hl7.terminology.r4
+```
+
+For example, this may resolve to
+`~/.fhir/packages/hl7.terminology.r4#7.4.0`. Supplying an explicit versioned
+directory continues to use that exact package.
 
 To scan an IG directory for ValueSets that directly include the candidate:
 

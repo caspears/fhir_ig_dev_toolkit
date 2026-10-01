@@ -409,6 +409,53 @@ def _package_resource_paths(package_dir: Path, resource_type: str) -> list[Path]
     return []
 
 
+def _package_declared_version(package_dir: Path) -> str | None:
+    for metadata_path in (
+        package_dir / "package" / "package.json",
+        package_dir / "package.json",
+    ):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        version = metadata.get("version") if isinstance(metadata, dict) else None
+        if isinstance(version, str) and version:
+            return version
+    if "#" in package_dir.name:
+        return package_dir.name.rsplit("#", 1)[1]
+    return None
+
+
+def _version_sort_key(version: str) -> tuple[Any, ...]:
+    """Create a practical semantic-version key without adding a dependency."""
+    main, separator, suffix = version.partition("-")
+    numeric = tuple(int(part) for part in re.findall(r"\d+", main))
+    return numeric, not bool(separator), suffix.casefold()
+
+
+def resolve_latest_package_dir(package_dir: Path) -> tuple[Path, str | None]:
+    """Resolve an unversioned package-family path to its latest installed version."""
+    expanded = package_dir.expanduser()
+    if expanded.is_dir():
+        resolved = expanded.resolve()
+        return resolved, _package_declared_version(resolved)
+    if "#" in expanded.name:
+        return expanded.resolve(), None
+    candidates: list[tuple[tuple[Any, ...], Path, str]] = []
+    parent = expanded.parent
+    if parent.is_dir():
+        for candidate in parent.glob(f"{expanded.name}#*"):
+            if not candidate.is_dir():
+                continue
+            version = _package_declared_version(candidate)
+            if version:
+                candidates.append((_version_sort_key(version), candidate.resolve(), version))
+    if not candidates:
+        return expanded.resolve(), None
+    _, selected, version = max(candidates, key=lambda item: item[0])
+    return selected, version
+
+
 def _index_package_resources(
     package_dir: Path, resource_type: str
 ) -> dict[str, dict[str, Any]]:
@@ -453,6 +500,114 @@ def _valueset_code_systems(value_set: dict[str, Any]) -> list[str]:
 
     collect_contains(_as_list((value_set.get("expansion") or {}).get("contains")))
     return sorted(systems)
+
+
+def _text_comparison(candidate: Any, target: Any) -> str:
+    if target in (None, ""):
+        return "target-missing"
+    if candidate in (None, ""):
+        return "candidate-missing"
+    if candidate == target:
+        return "exact"
+    if str(candidate).casefold() == str(target).casefold():
+        return "case-insensitive"
+    return "different"
+
+
+def compare_tho_target_artifacts(
+    proposal_matches: list[dict[str, Any]],
+    concepts: list[dict[str, Any]],
+    package_dir: Path,
+) -> list[dict[str, Any]]:
+    """Compare proposal target artifacts with an installed THO package."""
+    if not package_dir.is_dir():
+        raise AnalysisError(f"THO package directory does not exist: {package_dir}")
+    code_systems = _index_package_resources(package_dir, "CodeSystem")
+    value_sets = _index_package_resources(package_dir, "ValueSet")
+    if not code_systems and not value_sets:
+        raise AnalysisError(
+            "No CodeSystem or ValueSet JSON files were found in the THO package "
+            f"directory or its package subdirectory: {package_dir}"
+        )
+    compared = copy.deepcopy(proposal_matches)
+    candidate_by_code = {
+        concept["code"]: concept
+        for concept in concepts
+        if isinstance(concept.get("code"), str)
+    }
+    for proposal in compared:
+        artifacts: list[dict[str, Any]] = []
+        for canonical in proposal.get("target_canonicals", []):
+            artifact_type = None
+            index: dict[str, dict[str, Any]] = {}
+            if "/CodeSystem/" in canonical:
+                artifact_type = "CodeSystem"
+                index = code_systems
+            elif "/ValueSet/" in canonical:
+                artifact_type = "ValueSet"
+                index = value_sets
+            if artifact_type is None:
+                continue
+            artifact = index.get(canonical) or index.get(canonical.rsplit("/", 1)[-1])
+            if artifact is None:
+                artifacts.append(
+                    {
+                        "canonical": canonical,
+                        "resource_type": artifact_type,
+                        "status": "not-found-in-package",
+                    }
+                )
+                continue
+            result: dict[str, Any] = {
+                "canonical": canonical,
+                "resource_type": artifact_type,
+                "status": "found",
+                "id": artifact.get("id"),
+                "url": artifact.get("url"),
+                "version": artifact.get("version"),
+                "name": artifact.get("name"),
+                "title": artifact.get("title"),
+                "source": artifact.get("_source"),
+            }
+            if artifact_type == "CodeSystem":
+                target_concepts = {
+                    concept["code"]: concept
+                    for concept in _flatten_concepts(
+                        [
+                            item
+                            for item in _as_list(artifact.get("concept"))
+                            if isinstance(item, dict)
+                        ]
+                    )
+                    if isinstance(concept.get("code"), str)
+                }
+                concept_results: list[dict[str, Any]] = []
+                for code, candidate in candidate_by_code.items():
+                    target = target_concepts.get(code)
+                    concept_results.append(
+                        {
+                            "code": code,
+                            "status": "existing-code" if target else "absent-code",
+                            "candidate_display": candidate.get("display"),
+                            "target_display": target.get("display") if target else None,
+                            "display_comparison": _text_comparison(
+                                candidate.get("display"),
+                                target.get("display") if target else None,
+                            ),
+                            "candidate_definition": candidate.get("definition"),
+                            "target_definition": target.get("definition") if target else None,
+                            "definition_comparison": _text_comparison(
+                                candidate.get("definition"),
+                                target.get("definition") if target else None,
+                            ),
+                        }
+                    )
+                result["concept_comparison"] = concept_results
+            else:
+                result["included_code_systems"] = _valueset_code_systems(artifact)
+            artifacts.append(result)
+        proposal["tho_target_artifacts"] = artifacts
+    return compared
 
 
 def compare_base_fhir_bindings(
@@ -642,11 +797,153 @@ def _mentioned_terms(terms: list[str], text: str) -> list[str]:
     ]
 
 
+CONTEXT_STOP_WORDS = {
+    "a", "an", "and", "code", "codes", "codesystem", "for", "of", "the",
+    "to", "type", "types", "value", "values", "valueset", "vs", "cs",
+}
+
+
+def _context_tokens(value: Any, excluded: set[str] | None = None) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9]*", expanded)
+    }
+    return tokens - CONTEXT_STOP_WORDS - (excluded or set())
+
+
+def _proposal_context_alignment(
+    target_canonicals: list[str],
+    resource: dict[str, Any],
+    concepts: list[dict[str, Any]],
+    valueset_usage: list[dict[str, Any]],
+    binding_context: list[dict[str, Any]],
+) -> dict[str, Any]:
+    excluded = {
+        str(concept.get("code", "")).lower()
+        for concept in concepts
+        if concept.get("code")
+    }
+    excluded.update(
+        token
+        for concept in concepts
+        for token in _context_tokens(concept.get("display"))
+    )
+    target_tokens = set().union(
+        *(
+            _context_tokens(canonical.rsplit("/", 1)[-1], excluded)
+            for canonical in target_canonicals
+        )
+    ) if target_canonicals else set()
+    sources: list[dict[str, Any]] = []
+    for usage in valueset_usage:
+        label = " ".join(
+            str(usage.get(field) or "") for field in ("name", "title", "description")
+        )
+        sources.append(
+            {
+                "source": "local ValueSet",
+                "tokens": _context_tokens(label, excluded),
+                "weight": 4,
+                "details": {
+                    "url": usage.get("url"),
+                    "name": usage.get("name"),
+                    "title": usage.get("title"),
+                    "description": usage.get("description"),
+                },
+            }
+        )
+    for profile in binding_context:
+        for binding in profile.get("bindings", []):
+            sources.append(
+                {
+                    "source": "IG ValueSet binding",
+                    "tokens": _context_tokens(binding.get("path"), excluded),
+                    "weight": 3,
+                    "details": {
+                        "profile": profile.get("url") or profile.get("id"),
+                        "element": binding.get("path"),
+                        "value_set": binding.get("value_set"),
+                        "strength": binding.get("strength"),
+                    },
+                }
+            )
+            base = binding.get("base_fhir_comparison") or {}
+            base_text = " ".join(
+                str(base.get(field) or "")
+                for field in ("base_element_short", "base_element_definition")
+            )
+            sources.append(
+                {
+                    "source": "base FHIR element",
+                    "tokens": _context_tokens(base_text, excluded),
+                    "weight": 2,
+                    "details": {
+                        "structure_definition": base.get("base_structure_definition"),
+                        "element": base.get("base_element_path"),
+                        "binding_status": base.get("status"),
+                        "definition": base.get("base_element_definition"),
+                    },
+                }
+            )
+    sources.append(
+        {
+            "source": "candidate CodeSystem",
+            "tokens": _context_tokens(
+                " ".join(str(resource.get(field) or "") for field in ("name", "title", "description")),
+                excluded,
+            ),
+            "weight": 1,
+            "details": {
+                "url": resource.get("url"),
+                "name": resource.get("name"),
+                "title": resource.get("title"),
+            },
+        }
+    )
+    evidence: list[dict[str, Any]] = []
+    basis: list[dict[str, Any]] = []
+    score = 0
+    for source in sources:
+        matched = sorted(target_tokens & source["tokens"])
+        contribution = source["weight"] * len(matched)
+        basis.append(
+            {
+                "source": source["source"],
+                "matched_terms": matched,
+                "weight": source["weight"],
+                "contribution": contribution,
+                "details": source["details"],
+            }
+        )
+        if matched:
+            score += contribution
+            evidence.append(basis[-1])
+    if not target_canonicals:
+        alignment = "unknown"
+    elif score >= 4:
+        alignment = "high"
+    elif score:
+        alignment = "moderate"
+    else:
+        alignment = "low"
+    return {
+        "alignment": alignment,
+        "score": score,
+        "target_terms": sorted(target_tokens),
+        "evidence": evidence,
+        "basis": basis,
+    }
+
+
 def match_proposals(
     resource: dict[str, Any],
     concepts: list[dict[str, Any]],
     proposal_payloads: list[dict[str, Any]],
     valueset_usage: list[dict[str, Any]] | None = None,
+    binding_context: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     candidate_codes = [
         concept["code"] for concept in concepts if isinstance(concept.get("code"), str)
@@ -695,12 +992,29 @@ def match_proposals(
                 continue
             if candidate_codes and len(mentioned_codes) == len(candidate_codes):
                 coverage = "full"
+                code_coverage = "full"
             elif mentioned_codes:
                 coverage = "partial"
+                code_coverage = "partial"
             elif matched_local_canonicals:
                 coverage = "artifact"
+                code_coverage = "none"
             else:
                 coverage = "contextual"
+                code_coverage = "none"
+            context = _proposal_context_alignment(
+                canonicals,
+                resource,
+                concepts,
+                valueset_usage or [],
+                binding_context or [],
+            )
+            if code_coverage == "full" and context["alignment"] == "high":
+                assessment = "strong-existing-proposal-match"
+            elif code_coverage in {"full", "partial"} and context["alignment"] == "low":
+                assessment = "code-overlap-different-context"
+            else:
+                assessment = "manual-review"
             status = fields.get("status") or {}
             resolution = fields.get("resolution")
             matches.append(
@@ -715,14 +1029,29 @@ def match_proposals(
                         else resolution
                     ),
                     "coverage": coverage,
+                    "code_coverage": code_coverage,
+                    "context_alignment": context["alignment"],
+                    "context_score": context["score"],
+                    "context_target_terms": context["target_terms"],
+                    "context_evidence": context["evidence"],
+                    "context_basis": context["basis"],
+                    "assessment": assessment,
                     "matched_codes": mentioned_codes,
                     "matched_terms": matched_terms,
                     "matched_local_canonicals": matched_local_canonicals,
                     "target_canonicals": canonicals,
                 }
             )
-    rank = {"full": 0, "partial": 1, "artifact": 2, "contextual": 3}
-    return sorted(matches, key=lambda item: (rank[item["coverage"]], item.get("key") or ""))
+    alignment_rank = {"high": 0, "moderate": 1, "unknown": 2, "low": 3}
+    coverage_rank = {"full": 0, "partial": 1, "none": 2}
+    return sorted(
+        matches,
+        key=lambda item: (
+            alignment_rank[item["context_alignment"]],
+            coverage_rank[item["code_coverage"]],
+            item.get("key") or "",
+        ),
+    )
 
 
 def analyze(
@@ -731,6 +1060,7 @@ def analyze(
     proposal_payloads: list[dict[str, Any]] | None = None,
     valueset_usage: list[dict[str, Any]] | None = None,
     binding_context: list[dict[str, Any]] | None = None,
+    tho_package_dir: Path | None = None,
 ) -> dict[str, Any]:
     concepts = _flatten_concepts(
         [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
@@ -748,8 +1078,12 @@ def analyze(
     }
     if proposal_payloads:
         result["proposal_matches"] = match_proposals(
-            resource, concepts, proposal_payloads, valueset_usage
+            resource, concepts, proposal_payloads, valueset_usage, binding_context
         )
+        if tho_package_dir is not None:
+            result["proposal_matches"] = compare_tho_target_artifacts(
+                result["proposal_matches"], concepts, tho_package_dir
+            )
     if valueset_usage is not None:
         result["valueset_usage"] = valueset_usage
     if binding_context is not None:
@@ -791,8 +1125,8 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         if proposals:
             lines.extend(
                 [
-                    "| Proposal | Status | Match | Evidence | Target artifacts |",
-                    "|---|---|---|---|---|",
+                    "| Proposal | Status | Code coverage | Context | Assessment | Context evidence | Target artifacts |",
+                    "|---|---|---|---|---|---|---|",
                 ]
             )
             for proposal in proposals:
@@ -803,19 +1137,92 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                         [
                             proposal_link,
                             _escape_table(proposal.get("status")),
-                            _escape_table(proposal.get("coverage")),
-                            _escape_table(", ".join(
-                                proposal.get("matched_codes", [])
-                                or proposal.get("matched_terms", [])
-                                or proposal.get("matched_local_canonicals", [])
+                            _escape_table(proposal.get("code_coverage")),
+                            _escape_table(proposal.get("context_alignment")),
+                            _escape_table(proposal.get("assessment")),
+                            _escape_table("; ".join(
+                                f"{item['source']}: {', '.join(item['matched_terms'])}"
+                                for item in proposal.get("context_evidence", [])
                             )),
                             _escape_table(", ".join(proposal.get("target_canonicals", []))),
                         ]
                     )
                     + " |"
                 )
+            lines.extend([
+                "",
+                "### Context-alignment evidence",
+                "",
+                "The score compares meaningful terms from each proposal's target "
+                "artifact canonicals with the sources below. Candidate codes and "
+                "generic terminology words such as `code`, `ValueSet`, and `type` "
+                "are excluded. Binding strength is reported as evidence but is not "
+                "currently assigned additional weight.",
+            ])
+            for proposal in proposals:
+                lines.extend([
+                    "",
+                    f"#### {proposal.get('key')}",
+                    "",
+                    f"- Target context terms: {_escape_table(', '.join(proposal.get('context_target_terms', [])) or '(none)')}",
+                    f"- Alignment: {_escape_table(proposal.get('context_alignment'))}",
+                    f"- Score: {_escape_table(proposal.get('context_score'))}",
+                    f"- Assessment: {_escape_table(proposal.get('assessment'))}",
+                    "- Evidence sources:",
+                ])
+                for item in proposal.get("context_basis", []):
+                    details = item.get("details") or {}
+                    detail_text = "; ".join(
+                        f"{key}={value}"
+                        for key, value in details.items()
+                        if value not in (None, "", [])
+                    )
+                    matched = ", ".join(item.get("matched_terms", [])) or "none"
+                    lines.append(
+                        "  - "
+                        f"{item.get('source')}: matched={matched}; "
+                        f"weight={item.get('weight')}; "
+                        f"contribution={item.get('contribution')}; "
+                        f"{_escape_table(detail_text)}"
+                    )
         else:
             lines.append("No related proposal was found in the supplied Jira data.")
+
+        target_comparisons = [
+            proposal for proposal in proposals if "tho_target_artifacts" in proposal
+        ]
+        if target_comparisons:
+            lines.extend(["", "## Installed THO target-artifact comparison", ""])
+            lines.append(
+                "This section describes the installed THO package. An open proposal "
+                "may contain changes that are not yet present in that package."
+            )
+            for proposal in target_comparisons:
+                lines.extend(["", f"### {proposal.get('key')}", ""])
+                for artifact in proposal.get("tho_target_artifacts", []):
+                    lines.append(
+                        f"- `{_escape_table(artifact.get('canonical'))}` "
+                        f"({artifact.get('resource_type')}): {artifact.get('status')}"
+                    )
+                    if artifact.get("resource_type") == "CodeSystem" and artifact.get("status") == "found":
+                        for concept in artifact.get("concept_comparison", []):
+                            lines.append(
+                                "  - "
+                                f"`{_escape_table(concept.get('code'))}`: "
+                                f"{concept.get('status')}; "
+                                f"display={concept.get('display_comparison')}; "
+                                f"definition={concept.get('definition_comparison')}"
+                            )
+                            if concept.get("status") == "existing-code":
+                                lines.extend([
+                                    f"    - Candidate display: {_escape_table(concept.get('candidate_display'))}",
+                                    f"    - THO display: {_escape_table(concept.get('target_display'))}",
+                                    f"    - Candidate definition: {_escape_table(concept.get('candidate_definition'))}",
+                                    f"    - THO definition: {_escape_table(concept.get('target_definition'))}",
+                                ])
+                    elif artifact.get("resource_type") == "ValueSet" and artifact.get("status") == "found":
+                        systems = ", ".join(artifact.get("included_code_systems", [])) or "none identified"
+                        lines.append(f"  - Included CodeSystems: {_escape_table(systems)}")
 
     if "valueset_usage" in analysis:
         lines.extend(["", "## Local ValueSet usage", ""])
@@ -977,8 +1384,24 @@ def command_analyze(args: argparse.Namespace) -> int:
                 args.jira_url, jql, token=token, cookie=cookie
             )
         )
+    tho_package_dir: Path | None = None
+    if args.tho_package_dir:
+        tho_package_dir, tho_package_version = resolve_latest_package_dir(
+            args.tho_package_dir
+        )
+        if tho_package_dir != args.tho_package_dir.expanduser().resolve():
+            print(
+                "Resolved THO package "
+                f"{args.tho_package_dir} to {tho_package_dir} "
+                f"(version {tho_package_version})."
+            )
     result = analyze(
-        resource, source, proposal_payloads, valueset_usage, binding_context
+        resource,
+        source,
+        proposal_payloads,
+        valueset_usage,
+        binding_context,
+        tho_package_dir,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.json").write_text(
@@ -1021,6 +1444,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Extracted base FHIR package directory used to compare profile "
             "bindings with their base elements"
+        ),
+    )
+    analyze_parser.add_argument(
+        "--tho-package-dir",
+        type=Path,
+        help=(
+            "Installed hl7.terminology.r4 package directory, or unversioned "
+            "package-family path resolved to the latest installed version"
         ),
     )
     analyze_parser.add_argument(

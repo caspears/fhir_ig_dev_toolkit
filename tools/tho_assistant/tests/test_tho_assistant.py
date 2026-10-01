@@ -48,11 +48,178 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(match["key"], "UP-814")
         self.assertEqual(match["status"], "Consensus Review")
         self.assertEqual(match["coverage"], "full")
+        self.assertEqual(match["code_coverage"], "full")
         self.assertEqual(match["matched_codes"], ["copay", "coinsurance"])
         self.assertIn(
             "http://terminology.hl7.org/CodeSystem/benefit-type",
             match["target_canonicals"],
         )
+
+    def test_ranks_benefit_proposal_above_adjudication_code_overlap(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        up_814 = tho_assistant._load_json_or_fenced_json(self.proposal_fixture)
+        up_819 = {
+            "key": "UP-819",
+            "fields": {
+                "summary": "Add copay and coinsurance to adjudication codes",
+                "description": (
+                    "Targets http://terminology.hl7.org/CodeSystem/adjudication "
+                    "and http://terminology.hl7.org/ValueSet/adjudication."
+                ),
+                "status": {"name": "Proposal Draft"},
+            },
+        }
+        usages = tho_assistant.find_valueset_usage(
+            resource["url"], self.formulary_fixture.parent
+        )
+        bindings = [
+            {
+                "bindings": [
+                    {
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "base_fhir_comparison": {
+                            "base_element_short": "Type of cost",
+                            "base_element_definition": (
+                                "Type of cost (copay; coinsurance; deductible)."
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+        concepts = tho_assistant._flatten_concepts(resource["concept"])
+        matches = tho_assistant.match_proposals(
+            resource, concepts, [up_814, up_819], usages, bindings
+        )
+
+        self.assertEqual([match["key"] for match in matches], ["UP-814", "UP-819"])
+        self.assertEqual(matches[0]["code_coverage"], "full")
+        self.assertEqual(matches[0]["context_alignment"], "high")
+        self.assertEqual(matches[0]["assessment"], "strong-existing-proposal-match")
+        ig_binding = next(
+            item
+            for item in matches[0]["context_basis"]
+            if item["source"] == "IG ValueSet binding"
+        )
+        self.assertEqual(
+            ig_binding["details"]["element"],
+            "InsurancePlan.plan.specificCost.benefit.cost.type",
+        )
+        self.assertEqual(ig_binding["details"]["strength"], None)
+        self.assertEqual(ig_binding["matched_terms"], ["benefit"])
+        self.assertEqual(ig_binding["contribution"], 3)
+        self.assertEqual(matches[1]["code_coverage"], "full")
+        self.assertEqual(matches[1]["context_alignment"], "low")
+        self.assertEqual(matches[1]["assessment"], "code-overlap-different-context")
+
+        analysis = tho_assistant.analyze(
+            resource, self.formulary_fixture, [up_814, up_819], usages, bindings
+        )
+        markdown = tho_assistant.render_markdown(analysis)
+        self.assertIn("### Context-alignment evidence", markdown)
+        self.assertIn("IG ValueSet binding: matched=benefit", markdown)
+        self.assertIn(
+            "element=InsurancePlan.plan.specificCost.benefit.cost.type", markdown
+        )
+
+    def test_compares_candidate_concepts_with_installed_tho_targets(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        concepts = tho_assistant._flatten_concepts(resource["concept"])
+        proposals = [
+            {
+                "key": "UP-814",
+                "target_canonicals": [
+                    "http://terminology.hl7.org/CodeSystem/benefit-type",
+                    "http://terminology.hl7.org/ValueSet/benefit-type",
+                ],
+            }
+        ]
+        code_system = {
+            "resourceType": "CodeSystem",
+            "id": "benefit-type",
+            "url": "http://terminology.hl7.org/CodeSystem/benefit-type",
+            "version": "test",
+            "concept": [
+                {
+                    "code": "copay",
+                    "display": "Copayment",
+                    "definition": "A fixed member cost.",
+                }
+            ],
+        }
+        value_set = {
+            "resourceType": "ValueSet",
+            "id": "benefit-type",
+            "url": "http://terminology.hl7.org/ValueSet/benefit-type",
+            "compose": {
+                "include": [
+                    {"system": "http://terminology.hl7.org/CodeSystem/benefit-type"}
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package"
+            package.mkdir()
+            (package / "CodeSystem-benefit-type.json").write_text(
+                json.dumps(code_system), encoding="utf-8"
+            )
+            (package / "ValueSet-benefit-type.json").write_text(
+                json.dumps(value_set), encoding="utf-8"
+            )
+            compared = tho_assistant.compare_tho_target_artifacts(
+                proposals, concepts, Path(directory)
+            )
+
+        artifacts = compared[0]["tho_target_artifacts"]
+        code_result = next(
+            item for item in artifacts if item["resource_type"] == "CodeSystem"
+        )
+        value_set_result = next(
+            item for item in artifacts if item["resource_type"] == "ValueSet"
+        )
+        by_code = {
+            item["code"]: item for item in code_result["concept_comparison"]
+        }
+        self.assertEqual(by_code["copay"]["status"], "existing-code")
+        self.assertEqual(by_code["copay"]["display_comparison"], "different")
+        self.assertEqual(by_code["coinsurance"]["status"], "absent-code")
+        self.assertEqual(
+            value_set_result["included_code_systems"],
+            ["http://terminology.hl7.org/CodeSystem/benefit-type"],
+        )
+
+    def test_resolves_latest_installed_unversioned_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for version in ("7.3.0", "7.4.0-ballot", "7.4.0"):
+                package = root / f"hl7.terminology.r4#{version}" / "package"
+                package.mkdir(parents=True)
+                (package / "package.json").write_text(
+                    json.dumps(
+                        {
+                            "name": "hl7.terminology.r4",
+                            "version": version,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            selected, version = tho_assistant.resolve_latest_package_dir(
+                root / "hl7.terminology.r4"
+            )
+
+        self.assertEqual(selected.name, "hl7.terminology.r4#7.4.0")
+        self.assertEqual(version, "7.4.0")
+
+    def test_explicit_versioned_package_is_not_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requested = root / "hl7.terminology.r4#7.3.0"
+            requested.mkdir()
+            (root / "hl7.terminology.r4#7.4.0").mkdir()
+            selected, version = tho_assistant.resolve_latest_package_dir(requested)
+
+        self.assertEqual(selected.name, "hl7.terminology.r4#7.3.0")
+        self.assertEqual(version, "7.3.0")
 
     def test_finds_valueset_usage(self):
         resource = tho_assistant.load_resource(self.formulary_fixture)
