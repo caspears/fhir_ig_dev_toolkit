@@ -7,6 +7,7 @@ python tools/tho_assistant/tho_assistant.py analyze tools\\tho_assistant\\tests\
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
@@ -226,21 +227,29 @@ def _jira_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raise AnalysisError("Jira JSON must contain an issue or an issues array")
 
 
-def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[str, Any]]:
-    """Find local ValueSets that directly include the candidate CodeSystem."""
-    if not candidate_url:
-        return []
+def _artifact_paths(ig_dir: Path, resource_type: str) -> list[Path]:
+    pattern_json = f"{resource_type}-*.json"
+    pattern_xml = f"{resource_type}-*.xml"
     generated_resources = ig_dir / "fsh-generated" / "resources"
     output_dir = ig_dir / "output"
     if generated_resources.is_dir():
         scan_dir = generated_resources
-        paths = sorted(set(scan_dir.glob("ValueSet-*.json")) | set(scan_dir.glob("ValueSet-*.xml")))
+        return sorted(set(scan_dir.glob(pattern_json)) | set(scan_dir.glob(pattern_xml)))
     elif output_dir.is_dir():
         scan_dir = output_dir
-        paths = sorted(set(scan_dir.glob("ValueSet-*.json")) | set(scan_dir.glob("ValueSet-*.xml")))
-    else:
-        direct_paths = set(ig_dir.glob("ValueSet-*.json")) | set(ig_dir.glob("ValueSet-*.xml"))
-        paths = sorted(direct_paths or (set(ig_dir.rglob("ValueSet-*.json")) | set(ig_dir.rglob("ValueSet-*.xml"))))
+        return sorted(set(scan_dir.glob(pattern_json)) | set(scan_dir.glob(pattern_xml)))
+    direct_paths = set(ig_dir.glob(pattern_json)) | set(ig_dir.glob(pattern_xml))
+    return sorted(
+        direct_paths
+        or (set(ig_dir.rglob(pattern_json)) | set(ig_dir.rglob(pattern_xml)))
+    )
+
+
+def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[str, Any]]:
+    """Find local ValueSets that directly include the candidate CodeSystem."""
+    if not candidate_url:
+        return []
+    paths = _artifact_paths(ig_dir, "ValueSet")
     usages_by_identity: dict[str, dict[str, Any]] = {}
     for path in paths:
         try:
@@ -305,6 +314,230 @@ def find_valueset_usage(candidate_url: str | None, ig_dir: Path) -> list[dict[st
             }
         )
     return list(usages_by_identity.values())
+
+
+def find_structuredefinition_bindings(
+    valueset_usage: list[dict[str, Any]], ig_dir: Path
+) -> list[dict[str, Any]]:
+    """Find generated profiles whose elements bind to discovered local ValueSets."""
+    valueset_urls = {
+        usage["url"] for usage in valueset_usage if isinstance(usage.get("url"), str)
+    }
+    if not valueset_urls:
+        return []
+    profiles: dict[str, dict[str, Any]] = {}
+    for path in _artifact_paths(ig_dir, "StructureDefinition"):
+        try:
+            resource = load_fhir_resource(path)
+        except AnalysisError:
+            continue
+        if resource.get("resourceType") != "StructureDefinition":
+            continue
+        found: dict[tuple[str, str, str | None], set[str]] = {}
+        for section_name in ("differential", "snapshot"):
+            section = resource.get(section_name) or {}
+            for element in _as_list(section.get("element")):
+                if not isinstance(element, dict):
+                    continue
+                binding = element.get("binding") or {}
+                value_set = binding.get("valueSet")
+                if not isinstance(value_set, str):
+                    continue
+                unversioned = value_set.split("|", 1)[0]
+                if unversioned not in valueset_urls:
+                    continue
+                key = (element.get("path") or element.get("id"), value_set, binding.get("strength"))
+                found.setdefault(key, set()).add(section_name)
+        if not found:
+            continue
+        identity = resource.get("url") or resource.get("id") or str(path.resolve())
+        profile = profiles.get(identity)
+        if profile is None:
+            profile = {
+                "sources": [],
+                "id": resource.get("id"),
+                "url": resource.get("url"),
+                "name": resource.get("name"),
+                "title": resource.get("title"),
+                "type": resource.get("type"),
+                "kind": resource.get("kind"),
+                "base_definition": resource.get("baseDefinition"),
+                "bindings": [],
+            }
+            profiles[identity] = profile
+        profile["sources"].append(str(path.resolve()))
+        existing = {
+            (item["path"], item["value_set"], item.get("strength")): item
+            for item in profile["bindings"]
+        }
+        for (element_path, value_set, strength), sections in found.items():
+            key = (element_path, value_set, strength)
+            item = existing.get(key)
+            if item is None:
+                item = {
+                    "path": element_path,
+                    "value_set": value_set,
+                    "strength": strength,
+                    "sections": [],
+                }
+                profile["bindings"].append(item)
+                existing[key] = item
+            item["sections"] = sorted(set(item["sections"]) | sections)
+        profile["bindings"].sort(key=lambda item: (item["path"], item["value_set"]))
+    return sorted(profiles.values(), key=lambda item: item.get("url") or item.get("id") or "")
+
+
+def _canonical_url(value: Any) -> str | None:
+    """Return an unversioned canonical URL when value is a canonical string."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value.split("|", 1)[0]
+
+
+def _package_resource_paths(package_dir: Path, resource_type: str) -> list[Path]:
+    """Find JSON resources in an extracted FHIR package or its package folder."""
+    roots = [package_dir / "package", package_dir]
+    patterns = (f"{resource_type}-*.json", f"{resource_type.lower()}-*.json")
+    for root in roots:
+        if not root.is_dir():
+            continue
+        paths: set[Path] = set()
+        for pattern in patterns:
+            paths.update(root.glob(pattern))
+        if paths:
+            return sorted(paths)
+    return []
+
+
+def _index_package_resources(
+    package_dir: Path, resource_type: str
+) -> dict[str, dict[str, Any]]:
+    resources: dict[str, dict[str, Any]] = {}
+    for path in _package_resource_paths(package_dir, resource_type):
+        try:
+            resource = load_fhir_resource(path)
+        except AnalysisError:
+            continue
+        if resource.get("resourceType") != resource_type:
+            continue
+        resource["_source"] = str(path.resolve())
+        for identity in (resource.get("url"), resource.get("id")):
+            if isinstance(identity, str) and identity:
+                resources[identity] = resource
+    return resources
+
+
+def _find_element(resource: dict[str, Any], path: str) -> dict[str, Any] | None:
+    for section_name in ("snapshot", "differential"):
+        elements = _as_list((resource.get(section_name) or {}).get("element"))
+        for element in elements:
+            if isinstance(element, dict) and element.get("path") == path:
+                return element
+    return None
+
+
+def _valueset_code_systems(value_set: dict[str, Any]) -> list[str]:
+    systems = {
+        include.get("system")
+        for include in _as_list((value_set.get("compose") or {}).get("include"))
+        if isinstance(include, dict) and include.get("system")
+    }
+
+    def collect_contains(items: list[Any]) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("system"):
+                systems.add(item["system"])
+            collect_contains(_as_list(item.get("contains")))
+
+    collect_contains(_as_list((value_set.get("expansion") or {}).get("contains")))
+    return sorted(systems)
+
+
+def compare_base_fhir_bindings(
+    binding_context: list[dict[str, Any]], package_dir: Path
+) -> list[dict[str, Any]]:
+    """Resolve local profile bindings against an extracted base FHIR package."""
+    if not package_dir.is_dir():
+        raise AnalysisError(
+            f"FHIR package directory does not exist: {package_dir}"
+        )
+    structures = _index_package_resources(package_dir, "StructureDefinition")
+    if not structures:
+        raise AnalysisError(
+            "No StructureDefinition JSON files were found in the FHIR package "
+            f"directory or its package subdirectory: {package_dir}"
+        )
+    value_sets = _index_package_resources(package_dir, "ValueSet")
+    compared = copy.deepcopy(binding_context)
+    for profile in compared:
+        starting_base = _canonical_url(profile.get("base_definition"))
+        for local_binding in profile.get("bindings", []):
+            comparison: dict[str, Any] = {
+                "status": "base-structuredefinition-not-found",
+                "starting_base_definition": starting_base,
+            }
+            current_url = starting_base
+            visited: set[str] = set()
+            while current_url and current_url not in visited:
+                visited.add(current_url)
+                base = structures.get(current_url) or structures.get(
+                    current_url.rsplit("/", 1)[-1]
+                )
+                if base is None:
+                    comparison["missing_structure_definition"] = current_url
+                    break
+                comparison["status"] = "base-element-not-found"
+                comparison["base_structure_definition"] = base.get("url")
+                comparison["base_structure_definition_source"] = base.get("_source")
+                element = _find_element(base, local_binding.get("path"))
+                if element is not None:
+                    comparison.update(
+                        {
+                            "status": "base-element-unbound",
+                            "base_element_path": element.get("path"),
+                            "base_element_short": element.get("short"),
+                            "base_element_definition": element.get("definition"),
+                            "base_element_types": sorted(
+                                {
+                                    item["code"]
+                                    for item in _as_list(element.get("type"))
+                                    if isinstance(item, dict) and item.get("code")
+                                }
+                            ),
+                        }
+                    )
+                    binding = element.get("binding") or {}
+                    base_value_set = binding.get("valueSet")
+                    if binding.get("strength") or base_value_set:
+                        comparison.update(
+                            {
+                                "status": "resolved",
+                                "base_binding_strength": binding.get("strength"),
+                                "base_value_set": base_value_set,
+                            }
+                        )
+                        value_set_url = _canonical_url(base_value_set)
+                        value_set = None
+                        if value_set_url:
+                            value_set = value_sets.get(value_set_url) or value_sets.get(
+                                value_set_url.rsplit("/", 1)[-1]
+                            )
+                        if value_set:
+                            comparison["base_value_set_details"] = {
+                                "url": value_set.get("url"),
+                                "name": value_set.get("name"),
+                                "title": value_set.get("title"),
+                                "code_systems": _valueset_code_systems(value_set),
+                                "source": value_set.get("_source"),
+                            }
+                        elif value_set_url:
+                            comparison["base_value_set_status"] = "not-found-in-package"
+                    break
+                current_url = _canonical_url(base.get("baseDefinition"))
+            local_binding["base_fhir_comparison"] = comparison
+    return compared
 
 
 def _jql_text(value: str) -> str:
@@ -373,6 +606,13 @@ def search_jira_proposals(
                 "HL7 Jira rejected the browser session (HTTP 401). "
                 "The cookie may have expired; please verify and/or update "
                 "HL7_JIRA_COOKIE."
+            ) from exc
+        if exc.code == 400 and cookie:
+            raise AnalysisError(
+                "HL7 Jira rejected the browser-session cookie (HTTP 400). "
+                "Enter either the JSESSIONID value by itself or a complete "
+                "Cookie header such as JSESSIONID=your-session-value. The "
+                "cookie may also have expired."
             ) from exc
         detail = exc.read(500).decode("utf-8", errors="replace")
         if exc.code == 403 and "awselb" in str(exc.headers).lower():
@@ -490,6 +730,7 @@ def analyze(
     source: Path,
     proposal_payloads: list[dict[str, Any]] | None = None,
     valueset_usage: list[dict[str, Any]] | None = None,
+    binding_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     concepts = _flatten_concepts(
         [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
@@ -511,6 +752,8 @@ def analyze(
         )
     if valueset_usage is not None:
         result["valueset_usage"] = valueset_usage
+    if binding_context is not None:
+        result["binding_context"] = binding_context
     return result
 
 
@@ -595,6 +838,43 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         else:
             lines.append("No local ValueSet directly includes the candidate CodeSystem.")
 
+    if "binding_context" in analysis:
+        lines.extend(["", "## StructureDefinition binding context", ""])
+        profiles = analysis["binding_context"]
+        if profiles:
+            lines.extend([
+                "| Profile | Type | Element | Strength | ValueSet | Source section | Base definition |",
+                "|---|---|---|---|---|---|---|",
+            ])
+            for profile in profiles:
+                label = profile.get("title") or profile.get("name") or profile.get("id")
+                for binding in profile["bindings"]:
+                    base = binding.get("base_fhir_comparison") or {}
+                    base_details = base.get("base_value_set_details") or {}
+                    lines.append("| " + " | ".join([
+                        _escape_table(label),
+                        _escape_table(profile.get("type")),
+                        _escape_table(binding.get("path")),
+                        _escape_table(binding.get("strength")),
+                        _escape_table(binding.get("value_set")),
+                        _escape_table(", ".join(binding.get("sections", []))),
+                        _escape_table(profile.get("base_definition")),
+                    ]) + " |")
+                    if base:
+                        lines.extend([
+                            "",
+                            f"Base FHIR comparison for `{_escape_table(binding.get('path'))}`:",
+                            "",
+                            f"- Status: {_escape_table(base.get('status'))}",
+                            f"- Base element description: {_escape_table(base.get('base_element_definition'))}",
+                            f"- Base element type: {_escape_table(', '.join(base.get('base_element_types', [])))}",
+                            f"- Base binding strength: {_escape_table(base.get('base_binding_strength'))}",
+                            f"- Base ValueSet: {_escape_table(base.get('base_value_set'))}",
+                            f"- Base ValueSet CodeSystems: {_escape_table(', '.join(base_details.get('code_systems', [])))}",
+                        ])
+        else:
+            lines.append("No generated StructureDefinition binds to the discovered local ValueSets.")
+
     lines.extend([
         "",
         "## Concepts",
@@ -613,8 +893,24 @@ def render_markdown(analysis: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def normalize_jira_cookie(cookie: str | None) -> str | None:
+    """Accept either a bare JSESSIONID or a complete browser Cookie value."""
+    if cookie is None:
+        return None
+    cookie = cookie.strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
+    if not cookie:
+        return None
+    if "\r" in cookie or "\n" in cookie:
+        raise AnalysisError("The Jira cookie must be entered on a single line.")
+    if "=" not in cookie:
+        return f"JSESSIONID={cookie}"
+    return cookie
+
+
 def get_jira_credentials() -> tuple[str | None, str | None]:
-    cookie = os.environ.get("HL7_JIRA_COOKIE")
+    cookie = normalize_jira_cookie(os.environ.get("HL7_JIRA_COOKIE"))
     token = os.environ.get("HL7_JIRA_PAT")
     if not cookie and not token:
         if not sys.stdin.isatty():
@@ -622,7 +918,9 @@ def get_jira_credentials() -> tuple[str | None, str | None]:
                 "HL7_JIRA_COOKIE or HL7_JIRA_PAT is not set and a secure "
                 "prompt is unavailable"
             )
-        cookie = getpass.getpass("HL7 Jira browser Cookie header: ")
+        cookie = normalize_jira_cookie(
+            getpass.getpass("HL7 Jira JSESSIONID value (or complete Cookie header): ")
+        )
     if not cookie and not token:
         raise AnalysisError("HL7 Jira authentication is required")
     return token, cookie
@@ -664,6 +962,14 @@ def command_analyze(args: argparse.Namespace) -> int:
         find_valueset_usage(resource.get("url"), args.ig_dir.resolve())
         if args.ig_dir else None
     )
+    binding_context = (
+        find_structuredefinition_bindings(valueset_usage or [], args.ig_dir.resolve())
+        if args.ig_dir else None
+    )
+    if args.fhir_package_dir and binding_context is not None:
+        binding_context = compare_base_fhir_bindings(
+            binding_context, args.fhir_package_dir.expanduser().resolve()
+        )
     if args.search_proposals:
         jql = build_proposal_jql(resource, valueset_usage or [])
         proposal_payloads.append(
@@ -671,7 +977,9 @@ def command_analyze(args: argparse.Namespace) -> int:
                 args.jira_url, jql, token=token, cookie=cookie
             )
         )
-    result = analyze(resource, source, proposal_payloads, valueset_usage)
+    result = analyze(
+        resource, source, proposal_payloads, valueset_usage, binding_context
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -705,7 +1013,15 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--ig-dir",
         type=Path,
-        help="IG directory to scan recursively for ValueSets using the candidate",
+        help="IG directory to scan for ValueSet usage and profile bindings",
+    )
+    analyze_parser.add_argument(
+        "--fhir-package-dir",
+        type=Path,
+        help=(
+            "Extracted base FHIR package directory used to compare profile "
+            "bindings with their base elements"
+        ),
     )
     analyze_parser.add_argument(
         "--proposal-file",

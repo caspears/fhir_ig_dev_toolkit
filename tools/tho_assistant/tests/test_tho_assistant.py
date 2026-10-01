@@ -83,6 +83,211 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(len(usages), 1)
         self.assertEqual(len(usages[0]["sources"]), 2)
 
+    def test_finds_profile_binding_to_discovered_valueset(self):
+        resource = tho_assistant.load_resource(self.formulary_fixture)
+        valueset_source = self.formulary_fixture.parent / "ValueSet-BenefitCostTypeVS.json"
+        profile = {
+            "resourceType": "StructureDefinition",
+            "id": "TestInsurancePlan",
+            "url": "http://example.org/StructureDefinition/TestInsurancePlan",
+            "name": "TestInsurancePlan",
+            "title": "Test InsurancePlan",
+            "type": "InsurancePlan",
+            "kind": "resource",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+            "differential": {
+                "element": [
+                    {
+                        "id": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "binding": {
+                            "strength": "extensible",
+                            "valueSet": "http://hl7.org/fhir/us/davinci-drug-formulary/ValueSet/BenefitCostTypeVS|3.0.0-ballot",
+                        },
+                    }
+                ]
+            },
+            "snapshot": {
+                "element": [
+                    {
+                        "id": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "binding": {
+                            "strength": "extensible",
+                            "valueSet": "http://hl7.org/fhir/us/davinci-drug-formulary/ValueSet/BenefitCostTypeVS|3.0.0-ballot",
+                        },
+                    }
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / valueset_source.name).write_text(
+                valueset_source.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (root / "StructureDefinition-TestInsurancePlan.json").write_text(
+                json.dumps(profile), encoding="utf-8"
+            )
+            usages = tho_assistant.find_valueset_usage(resource["url"], root)
+            bindings = tho_assistant.find_structuredefinition_bindings(usages, root)
+
+        self.assertEqual(len(bindings), 1)
+        self.assertEqual(bindings[0]["type"], "InsurancePlan")
+        self.assertEqual(
+            bindings[0]["bindings"][0]["path"],
+            "InsurancePlan.plan.specificCost.benefit.cost.type",
+        )
+        self.assertEqual(bindings[0]["bindings"][0]["strength"], "extensible")
+        self.assertEqual(
+            bindings[0]["bindings"][0]["sections"],
+            ["differential", "snapshot"],
+        )
+
+    def test_compares_profile_binding_with_base_fhir_package(self):
+        binding_context = [
+            {
+                "id": "TestInsurancePlan",
+                "base_definition": "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+                "bindings": [
+                    {
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "value_set": "http://example.org/ValueSet/local-benefit-type",
+                        "strength": "extensible",
+                        "sections": ["differential"],
+                    }
+                ],
+            }
+        ]
+        base_structure = {
+            "resourceType": "StructureDefinition",
+            "id": "InsurancePlan",
+            "url": "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+            "snapshot": {
+                "element": [
+                    {
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "binding": {
+                            "strength": "example",
+                            "valueSet": "http://hl7.org/fhir/ValueSet/benefit-type|4.0.1",
+                        },
+                    }
+                ]
+            },
+        }
+        base_valueset = {
+            "resourceType": "ValueSet",
+            "id": "benefit-type",
+            "url": "http://hl7.org/fhir/ValueSet/benefit-type",
+            "name": "BenefitTypeCodes",
+            "compose": {
+                "include": [
+                    {"system": "http://terminology.hl7.org/CodeSystem/benefit-type"}
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package"
+            package.mkdir()
+            (package / "StructureDefinition-InsurancePlan.json").write_text(
+                json.dumps(base_structure), encoding="utf-8"
+            )
+            (package / "ValueSet-benefit-type.json").write_text(
+                json.dumps(base_valueset), encoding="utf-8"
+            )
+            compared = tho_assistant.compare_base_fhir_bindings(
+                binding_context, Path(directory)
+            )
+
+        base = compared[0]["bindings"][0]["base_fhir_comparison"]
+        self.assertEqual(base["status"], "resolved")
+        self.assertEqual(base["base_binding_strength"], "example")
+        self.assertEqual(
+            base["base_value_set"],
+            "http://hl7.org/fhir/ValueSet/benefit-type|4.0.1",
+        )
+        self.assertEqual(
+            base["base_value_set_details"]["code_systems"],
+            ["http://terminology.hl7.org/CodeSystem/benefit-type"],
+        )
+        self.assertNotIn("base_fhir_comparison", binding_context[0]["bindings"][0])
+
+    def test_base_fhir_comparison_reports_missing_structuredefinition(self):
+        binding_context = [
+            {
+                "base_definition": "http://hl7.org/fhir/StructureDefinition/Missing",
+                "bindings": [{"path": "Missing.code"}],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            unrelated = {
+                "resourceType": "StructureDefinition",
+                "id": "Unrelated",
+                "url": "http://hl7.org/fhir/StructureDefinition/Unrelated",
+                "snapshot": {"element": [{"path": "Unrelated"}]},
+            }
+            (Path(directory) / "StructureDefinition-Unrelated.json").write_text(
+                json.dumps(unrelated), encoding="utf-8"
+            )
+            compared = tho_assistant.compare_base_fhir_bindings(
+                binding_context, Path(directory)
+            )
+
+        result = compared[0]["bindings"][0]["base_fhir_comparison"]
+        self.assertEqual(result["status"], "base-structuredefinition-not-found")
+        self.assertEqual(
+            result["missing_structure_definition"],
+            "http://hl7.org/fhir/StructureDefinition/Missing",
+        )
+
+    def test_base_fhir_comparison_rejects_empty_package_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(tho_assistant.AnalysisError) as caught:
+                tho_assistant.compare_base_fhir_bindings([], Path(directory))
+
+        self.assertIn("No StructureDefinition JSON files", str(caught.exception))
+
+    def test_base_fhir_comparison_preserves_unbound_element_context(self):
+        binding_context = [
+            {
+                "base_definition": "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+                "bindings": [
+                    {"path": "InsurancePlan.plan.specificCost.benefit.cost.type"}
+                ],
+            }
+        ]
+        base_structure = {
+            "resourceType": "StructureDefinition",
+            "id": "InsurancePlan",
+            "url": "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/DomainResource",
+            "snapshot": {
+                "element": [
+                    {
+                        "path": "InsurancePlan.plan.specificCost.benefit.cost.type",
+                        "short": "Type of cost",
+                        "definition": "Type of cost (copay; coinsurance; deductible).",
+                        "type": [{"code": "CodeableConcept"}],
+                    }
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "StructureDefinition-InsurancePlan.json").write_text(
+                json.dumps(base_structure), encoding="utf-8"
+            )
+            compared = tho_assistant.compare_base_fhir_bindings(
+                binding_context, Path(directory)
+            )
+
+        result = compared[0]["bindings"][0]["base_fhir_comparison"]
+        self.assertEqual(result["status"], "base-element-unbound")
+        self.assertEqual(result["base_element_short"], "Type of cost")
+        self.assertEqual(result["base_element_types"], ["CodeableConcept"])
+        self.assertEqual(
+            result["base_structure_definition"],
+            "http://hl7.org/fhir/StructureDefinition/InsurancePlan",
+        )
+
     def test_filters_unrelated_jira_results_and_keeps_context(self):
         resource = tho_assistant.load_resource(self.formulary_fixture)
         payload = {
@@ -226,6 +431,46 @@ class AnalyzerTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("cookie may have expired", message)
         self.assertIn("HL7_JIRA_COOKIE", message)
+        self.assertNotIn("<html>", message)
+
+    def test_normalizes_bare_jira_session_id(self):
+        self.assertEqual(
+            tho_assistant.normalize_jira_cookie("secret-session-value"),
+            "JSESSIONID=secret-session-value",
+        )
+        self.assertEqual(
+            tho_assistant.normalize_jira_cookie("JSESSIONID=secret-session-value"),
+            "JSESSIONID=secret-session-value",
+        )
+        self.assertEqual(
+            tho_assistant.normalize_jira_cookie(
+                "Cookie: JSESSIONID=secret-session-value; another=value"
+            ),
+            "JSESSIONID=secret-session-value; another=value",
+        )
+
+    def test_bad_request_hides_html_and_explains_cookie_format(self):
+        html = b"<html><head><title>Bad Request (400)</title></head></html>"
+        bad_request = tho_assistant.error.HTTPError(
+            "https://jira.hl7.org/rest/api/2/search",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(html),
+        )
+        with mock.patch.object(
+            tho_assistant.request, "urlopen", side_effect=bad_request
+        ):
+            with self.assertRaises(tho_assistant.AnalysisError) as caught:
+                tho_assistant.search_jira_proposals(
+                    "https://jira.hl7.org",
+                    "project=UP",
+                    cookie="JSESSIONID=invalid",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("JSESSIONID", message)
         self.assertNotIn("<html>", message)
 
     def test_xml_input(self):

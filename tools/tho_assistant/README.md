@@ -44,6 +44,37 @@ artifacts, and uses a recursive fallback only when neither standard location is
 available. It reads only `ValueSet-*` JSON/XML files and consolidates multiple
 representations by canonical URL.
 
+It also scans generated `StructureDefinition-*` resources for bindings to the
+discovered local ValueSets. The report identifies the profile, resource type,
+element path, binding strength, differential/snapshot provenance, and base
+definition.
+
+To compare those bindings with the corresponding elements in an extracted base
+FHIR package, add `--fhir-package-dir`. The path may identify either the package
+root or its inner `package` directory:
+
+```bash
+python tools/tho_assistant/tho_assistant.py analyze path/to/CodeSystem.json \
+  --ig-dir path/to/ig \
+  --fhir-package-dir path/to/hl7.fhir.r4.core \
+  --output-dir build/tho-analysis
+```
+
+The comparison follows the base-definition chain, reports the inherited base
+binding and strength, and summarizes the CodeSystems included by the base
+ValueSet when that ValueSet is present in the supplied package. It does not
+download packages automatically. Direct `.fsh` source parsing is not yet
+included.
+
+When the corresponding base element exists without a binding, the result is
+`base-element-unbound`. Its short description, definition, and datatype are
+retained as terminology-matching context rather than continuing to an unrelated
+ancestor element.
+
+User-home paths such as `~/.fhir/packages/hl7.fhir.r4.core#4.0.1` are expanded
+by the tool. An invalid or empty package path fails before analysis with a
+specific package-directory message.
+
 HL7's AWS front end currently rejects PAT-only REST requests, while REST calls
 made with an authenticated browser session work. For proposal discovery, copy
 the `Cookie` request-header value from a signed-in Jira REST request into the
@@ -53,11 +84,15 @@ it as a command-line argument.
 
 For example, in the browser developer tools, reload
 `https://jira.hl7.org/rest/api/2/myself`, select the request in the Network tab,
-and copy only its `Cookie` request-header value. Then, in PowerShell:
+and copy the `JSESSIONID` cookie value. Then, in PowerShell, either the bare
+value or the complete cookie form may be used:
 
 ```powershell
-$env:HL7_JIRA_COOKIE = "cookie-name=cookie-value; another-name=another-value"
+$env:HL7_JIRA_COOKIE = "JSESSIONID=your-session-value"
 ```
+
+If the environment variable is not set, the secure prompt likewise accepts
+either the JSESSIONID value alone or `JSESSIONID=your-session-value`.
 
 Test Jira access before running the local IG scan:
 
@@ -90,6 +125,8 @@ Jira HTML login response is not printed.
 - Jira results are ranked as full-code, partial-code, artifact, or contextual
   matches. Unrelated results returned by Jira's text search are omitted.
 - Semantic comparison of code definitions is not yet implemented.
+- Base FHIR comparison requires an explicitly supplied extracted package and
+  does not yet validate that its FHIR version matches the IG.
 - Questionnaire, CQL, and StructureMap artifacts will be added after the
   normalized analysis is tested against a real candidate.
 - The generated review flags are prompts for human review, not governance
