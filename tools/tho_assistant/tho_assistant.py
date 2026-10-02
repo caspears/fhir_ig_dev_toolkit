@@ -1300,6 +1300,17 @@ def target_style_assessment(code: str, existing: dict[str, Any] | None, inventor
             "reason": "Potential addition only; review target examples and the applicable concept group. This finding does not establish that a new code is needed."}
 
 
+def is_tho_canonical(value: str) -> bool:
+    return bool(re.fullmatch(r"https?://terminology\.hl7\.org/CodeSystem/[^\s/?#]+", value))
+
+
+def tho_catalog(package_dir: Path) -> list[dict[str, Any]]:
+    indexed = _index_package_resources(package_dir, "CodeSystem")
+    catalog = {r["url"]: {k: r.get(k) for k in ("url", "name", "title", "version", "description")}
+               for r in indexed.values() if isinstance(r.get("url"), str) and is_tho_canonical(r["url"])}
+    return [catalog[url] for url in sorted(catalog)]
+
+
 def analyze(
     resource: dict[str, Any],
     source: Path,
@@ -1366,6 +1377,7 @@ def analyze(
         result["binding_context"] = binding_context
     if tho_package_dir is not None:
         targets = discover_context_targets(valueset_usage or [], binding_context or [])
+        result["tho_code_system_catalog"] = tho_catalog(tho_package_dir)
         inspected = compare_tho_target_artifacts(
             [{"target_canonicals": [target["canonical"]]} for target in targets], concepts, tho_package_dir)
         result["context_target_artifacts"] = [
@@ -1419,6 +1431,7 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
     current = build_review_template(analysis)["decisions"]
     results = []
     seen = set()
+    confirmed_sources = set()
     for decision in review["decisions"]:
         if not isinstance(decision, dict) or decision.get("decision") not in {"pending", "confirmed", "rejected"}:
             raise AnalysisError("Each review decision must be pending, confirmed, or rejected.")
@@ -1428,6 +1441,10 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
         if not valid_proposal or not all(isinstance(value, str) and value for value in identity[1:]) or identity in seen:
             raise AnalysisError("Review decisions require unique proposal/source/target identities.")
         seen.add(identity)
+        if decision["decision"] == "confirmed":
+            if decision["source_code"] in confirmed_sources:
+                raise AnalysisError("Only one mapping or system candidate may be confirmed per source code. Choose one candidate in the review page.")
+            confirmed_sources.add(decision["source_code"])
         matching = [row for row in current if tuple(row[key] for key in
                     ("proposal", "source_code", "target_system", "target_code")) == identity]
         status = decision["decision"]
@@ -1444,6 +1461,21 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
                 status = "requires-re-review"
         results.append({**decision, "effective_status": status})
     analysis["review_decisions"] = results
+    requests = review.get("change_requests", [])
+    if not isinstance(requests, list):
+        raise AnalysisError("change_requests must be an array.")
+    seen_requests = set()
+    for item in requests:
+        if not isinstance(item, dict) or not isinstance(item.get("source_code"), str) or item["source_code"] in seen_requests:
+            raise AnalysisError("Change requests require unique source codes.")
+        seen_requests.add(item["source_code"])
+        for field, values in {"target_kind": {"undecided", "existing", "new"}, "relationship": {"undecided", "equivalent", "needs-modification", "different-concept"}, "action": {"investigate", "reuse", "modify", "add", "create-system"}}.items():
+            if item.get(field) not in values:
+                raise AnalysisError(f"Invalid change request {field}.")
+        for field in ("target_system", "target_code", "display", "definition", "rationale", "system_scope"):
+            if not isinstance(item.get(field, ""), str):
+                raise AnalysisError(f"Change request {field} must be text.")
+    analysis["change_requests"] = copy.deepcopy(requests)
 
 
 def maintain_review_file(analysis: dict[str, Any], path: Path) -> tuple[bool, int]:
@@ -1986,7 +2018,7 @@ def command_analyze(args: argparse.Namespace) -> int:
         raise AnalysisError("Use --review-file alone; --write-review-template is deprecated.")
     review_path = (args.review_file or args.write_review_template or
                    (output_dir / "review-decisions.json")).expanduser().resolve()
-    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", source}:
+    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", output_dir / "proposal-draft.md", output_dir / "review.html", source}:
         raise AnalysisError("The review file must be separate from the input and generated reports.")
     created, added = maintain_review_file(result, review_path)
     result["recommendations"] = build_recommendations(result)
@@ -1996,9 +2028,11 @@ def command_analyze(args: argparse.Namespace) -> int:
     (output_dir / "concept-inventory.md").write_text(
         render_markdown(result), encoding="utf-8"
     )
+    (output_dir / "proposal-draft.md").write_text(render_proposal_draft(result), encoding="utf-8")
     print(f"Analyzed {result['concept_count']} concepts from {source}")
     print(f"Wrote {output_dir / 'analysis.json'}")
     print(f"Wrote {output_dir / 'concept-inventory.md'}")
+    print(f"Wrote {output_dir / 'proposal-draft.md'} (generated working draft; keep manual edits in a separate copy)")
     print(f"Review file {'created' if created else 'reused'}: {review_path}")
     if added:
         print(f"Added {added} pending mappings; existing decisions and reviewed evidence preserved.")
@@ -2031,6 +2065,118 @@ def review_next_steps(counts: dict[str, int]) -> list[str]:
     return instructions
 
 
+def render_proposal_draft(analysis: dict[str, Any]) -> str:
+    recommendations = build_recommendations(analysis)
+    lines = ["# THO proposal preparation draft", "",
+             "Working draft for human review. No Jira submission or THO approval is implied.", "",
+             f"Source CodeSystem: {analysis['metadata'].get('url')}",
+             f"Source version: {analysis['metadata'].get('version') or 'unspecified'}", "",
+             "## Reviewed scope", "",
+             "Confirmed proposal mappings support coordination with existing tickets. System suitability selects a target for investigation only; it does not approve additions or equivalence."]
+    for recommendation in recommendations:
+        code = recommendation["source_code"]
+        lines.extend(["", f"## Candidate `{code}`", "", f"Next action: {recommendation['action']}", recommendation["reason"]])
+        source = next(c for c in analysis["concepts"] if c["code"] == code)
+        lines.extend(["", "### Source wording", "", f"Display: {_escape_table(source.get('display'))}", f"Definition: {_escape_table(source.get('definition'))}"])
+        decisions = [d for d in analysis.get("review_decisions", []) if d.get("source_code") == code]
+        if recommendation["action"] in {"resolve-conflicting-decisions", "re-review-evidence", "review-candidates"}:
+            lines.extend(["", "**Not ready for proposal wording.** Resolve the review action above before selecting a target or change."])
+        else:
+            for decision in decisions:
+                if decision.get("effective_status") != "confirmed":
+                    continue
+                lines.extend(["", f"### Reviewed target: {decision['target_system']}", "", f"Reviewer note: {_escape_table(decision.get('note')) or '[Add rationale]'}"])
+                if decision.get("decision_kind") == "target-system-suitability":
+                    lines.extend(["", "Candidate change: **unresolved**. Check existing concepts and related proposals before choosing reuse, modification, or addition.",
+                                  "Proposed target identifier: **unresolved** (the source identifier above is not an approved target code).",
+                                  "Proposed display and definition: **unresolved**. Use the source wording as input and broaden it as appropriate for the target system."])
+                    continue
+                proposal = next((p for p in analysis.get("proposal_matches", []) if p.get("key") == decision.get("proposal")), {})
+                artifact = next((a for a in proposal.get("tho_target_artifacts", []) if a.get("canonical") == decision["target_system"]), {})
+                row = next((r for r in artifact.get("concept_comparison", []) if r.get("code") == code and r.get("target_code") == decision["target_code"]), {})
+                evidence = decision.get("reviewed_evidence") or {}
+                lines.extend(["", f"Related ticket: {decision['proposal']} — {proposal.get('status') or 'status unavailable'}",
+                              "Preparation mode: coordinate with this ticket; do not prepare a duplicate submission without reviewing its scope.",
+                              f"Reviewed target code: `{decision['target_code']}`",
+                              f"Installed target version: {artifact.get('version') or 'unavailable'}",
+                              f"Change inferred relative to installed package: {row.get('inferred_change') or 'unresolved'}", "",
+                              "### Proposed wording from reviewed evidence", "",
+                              f"Display: {_escape_table(evidence.get('proposed_display')) or '[Not available]'}",
+                              f"Definition: {_escape_table(evidence.get('proposed_definition')) or '[Not available]'}",
+                              f"Evidence source: {evidence.get('proposed_source') or 'Jira extraction'}"])
+                if evidence.get("draft_url"):
+                    lines.append(f"Draft URL: {evidence['draft_url']}")
+                for warning in recommendation.get("context_warnings", []):
+                    lines.append(f"Context review: {_escape_table(warning)}")
+        lines.extend(["", "### Decisions included", ""])
+        lines.extend(f"- {d.get('proposal') or 'Target suitability'}: {d.get('effective_status')}; target `{d['target_system']}#{d['target_code']}`." for d in decisions)
+    lines.extend(["", "## Explicit requested changes", "", "These are reviewer-authored intentions, separate from candidate mapping decisions. Alternative targets have not automatically been searched or validated."])
+    for item in analysis.get("change_requests", []):
+        source = next((c for c in analysis["concepts"] if c["code"] == item["source_code"]), None)
+        issues = []
+        if item.get("confirmed_mapping"):
+            mapping = item["confirmed_mapping"]
+            matches = [d for d in analysis.get("review_decisions", []) if d.get("source_code") == item["source_code"] and d.get("effective_status") == "confirmed" and d.get("decision_kind") != "target-system-suitability" and all(d.get(k) == mapping.get(k) for k in ("proposal", "target_system", "target_code"))]
+            if not matches:
+                issues.append("Automatic reuse request no longer has a current confirmed mapping; review it again.")
+        if item.get("confirmed_suitability") and not any(d.get("source_code") == item["source_code"] and d.get("decision_kind") == "target-system-suitability" and d.get("effective_status") == "confirmed" and d.get("target_system") == item["confirmed_suitability"].get("target_system") for d in analysis.get("review_decisions", [])):
+            issues.append("Addition request no longer has current confirmed system suitability; review it again.")
+        if source is None or item.get("source_evidence") != {k: source.get(k) for k in ("code", "display", "definition")}:
+            issues.append("Source evidence changed or is unavailable; review this request again.")
+        if item["target_kind"] == "undecided" or item["action"] == "investigate":
+            issues.append("Target or action remains undecided.")
+        if not item.get("target_system") or not item.get("rationale"):
+            issues.append("Provide the target canonical and rationale.")
+        if item.get("target_system") and not is_tho_canonical(item["target_system"]):
+            issues.append("Target must be a terminology.hl7.org CodeSystem canonical URL.")
+        if item["target_kind"] == "existing" and item.get("target_system") not in {s["url"] for s in analysis.get("tho_code_system_catalog", [])}:
+            issues.append("Existing CodeSystem was not verified in the supplied THO package; refresh lookup evidence.")
+        if item["action"] in {"add", "modify", "create-system"} and not all(item.get(k) for k in ("target_code", "display", "definition")):
+            issues.append("Provide target code, display, and definition.")
+        if item["action"] == "reuse" and (item["relationship"] != "equivalent" or not item.get("target_code")):
+            issues.append("Reuse requires an equivalent relationship and a target code.")
+        if item["action"] == "modify" and item["relationship"] != "needs-modification":
+            issues.append("Modification requires the needs-modification relationship.")
+        if item["action"] == "add" and item["relationship"] != "different-concept":
+            issues.append("Addition requires the different-concept relationship after reviewing existing concepts.")
+        if item["target_kind"] == "new" and (item["action"] != "create-system" or not item.get("system_scope")):
+            issues.append("A new system requires create-system and a scope statement.")
+        if item["action"] == "create-system" and item["target_kind"] != "new":
+            issues.append("Create-system requires a new target system.")
+        lines.extend(["", f"### Request for `{item['source_code']}`", "", "Status: " + ("needs review" if issues else "working proposal for steward review")])
+        for field in ("target_kind", "target_system", "relationship", "action", "target_code", "display", "definition", "rationale", "system_scope"):
+            lines.append(f"- {field}: {_escape_table(item.get(field)) or '[Unspecified]'}")
+        lines.extend(f"- Unresolved: {issue}" for issue in issues)
+    lines.extend(["", "## IG usage evidence", ""])
+    for profile in analysis.get("binding_context", []):
+        for binding in profile.get("bindings", []):
+            lines.append(f"- Profile: {profile.get('url') or profile.get('id')}; element: {binding.get('path')}; ValueSet: {binding.get('value_set')}; strength: {binding.get('strength')}.")
+    lines.extend(["", "## Complete before submission or IG changes", "",
+                  "- Confirm the requested change and rationale with the target CodeSystem steward; resolve all placeholders.",
+                  "- Verify existing terminology and related proposals; absent exact codes do not establish a need for additions.",
+                  "- Review display, definition, spelling, identifier style, and ValueSet scope. Automated quality review is incomplete.",
+                  "- Verify published target content in the intended THO release before changing the IG.", ""])
+    return "\n".join(lines)
+
+
+def command_prepare_proposal(args: argparse.Namespace) -> int:
+    directory = args.output_dir.expanduser().resolve()
+    review_path = (args.review_file or directory / "review-decisions.json").expanduser().resolve()
+    try:
+        analysis = json.loads((directory / "analysis.json").read_text(encoding="utf-8"))
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AnalysisError(f"Cannot load analysis and review files: {error}") from error
+    apply_review_decisions(analysis, review)
+    destination = directory / "proposal-draft.md"
+    if destination == review_path:
+        raise AnalysisError("Proposal draft and review JSON must use separate paths.")
+    destination.write_text(render_proposal_draft(analysis), encoding="utf-8")
+    print(f"Wrote {destination}")
+    print("Working draft based on saved analysis evidence. Refresh analysis before relying on current Jira or draft-build status. Resolve placeholders and coordinate with existing tickets before submission.")
+    return 0
+
+
 def command_review(args: argparse.Namespace) -> int:
     directory = args.output_dir.expanduser().resolve()
     review_path = (args.review_file or directory / "review-decisions.json").expanduser().resolve()
@@ -2042,7 +2188,24 @@ def command_review(args: argparse.Namespace) -> int:
     apply_review_decisions(analysis, review)
     current = build_review_template(analysis)["decisions"]
     identity = lambda d: tuple(d.get(k) for k in ("proposal", "source_code", "target_system", "target_code"))
-    payload = {"review": review, "path": str(review_path),
+    catalog = analysis.get("tho_code_system_catalog", [])
+    if getattr(args, "tho_package_dir", None):
+        package_dir, _ = resolve_latest_package_dir(args.tho_package_dir)
+        catalog = tho_catalog(package_dir)
+    suggestions = {}
+    for concept in analysis["concepts"]:
+        suggested = {}
+        for artifact in analysis.get("context_target_artifacts", []):
+            if is_tho_canonical(artifact.get("canonical", "")):
+                suggested.setdefault(artifact["canonical"], []).extend(e.get("source", "IG context") for e in artifact.get("discovery_evidence", []))
+        for proposal in analysis.get("proposal_matches", []):
+            for canonical in proposal.get("target_canonicals", []):
+                if is_tho_canonical(canonical):
+                    suggested.setdefault(canonical, []).append(f"{proposal['key']} · context {proposal.get('context_alignment', 'unknown')}")
+        suggestions[concept["code"]] = suggested
+    payload = {"review": review, "path": str(review_path), "concepts": analysis["concepts"],
+               "catalog": catalog, "suggestions": suggestions,
+               "target_styles": {a["canonical"]: a["style_review"]["summaries"] for a in list(analysis.get("context_target_artifacts", [])) + [a for p in analysis.get("proposal_matches", []) for a in p.get("tho_target_artifacts", [])] if a.get("style_review")},
                "contexts": [next(({k: p.get(k) for k in ("context_alignment", "context_score", "context_evidence", "assessment")} for p in analysis.get("proposal_matches", []) if p.get("key") == d.get("proposal")), None) for d in review["decisions"]],
                "kinds": [next((c.get("decision_kind") for c in current if identity(c) == identity(d)), None) for d in review["decisions"]],
                "statuses": [d["effective_status"] for d in analysis["review_decisions"]],
@@ -2122,7 +2285,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser = subparsers.add_parser("review", help="Create an offline browser review page")
     review_parser.add_argument("--output-dir", required=True, type=Path)
     review_parser.add_argument("--review-file", type=Path)
+    review_parser.add_argument("--tho-package-dir", type=Path, help="Refresh target lookup catalog from an installed THO package")
     review_parser.set_defaults(handler=command_review)
+    draft_parser = subparsers.add_parser("prepare-proposal", help="Prepare a reviewed working draft without submitting to Jira")
+    draft_parser.add_argument("--output-dir", required=True, type=Path)
+    draft_parser.add_argument("--review-file", type=Path)
+    draft_parser.set_defaults(handler=command_prepare_proposal)
     return parser
 
 

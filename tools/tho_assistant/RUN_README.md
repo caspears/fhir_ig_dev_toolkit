@@ -76,8 +76,7 @@ python tools/tho_assistant/tho_assistant.py analyze `
 After updating the review file (or after using the UI to review below), run again the same way for the final choice pages
 
 
-
-
+Build review directly (whould not be needed generally)
 ```shell
 python tools/tho_assistant/tho_assistant.py review `
   --output-dir build/tho-analysis/BenefitCostTypeCS
@@ -86,4 +85,9 @@ Open the generated review.html. You can read the evidence, select decisions, and
 run the previous added review template step
 
 
+Build proposal
 
+```shell
+python tools/tho_assistant/tho_assistant.py prepare-proposal `
+  --output-dir build/tho-analysis/BenefitCostTypeCS
+```

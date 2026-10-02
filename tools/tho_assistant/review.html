@@ -3,9 +3,10 @@
 <title>THO mapping review</title>
 <style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#172b3a}article{border:1px solid #bbc;padding:1rem;margin:1rem 0;border-radius:8px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f5f7;padding:1rem}textarea{display:block;width:95%;min-height:4rem}select,button{font:inherit;padding:.5rem}label{display:block;margin:.7rem 0}small{display:block}button{background:#174d70;color:white;border:0;border-radius:4px}</style>
 <h1>THO mapping review</h1><p id="source"></p>
+<p id="notice" role="status" style="position:sticky;top:0;background:#fff1c9;padding:.7rem;display:none"></p>
 <p>Review each mapping or system suitability decision. Confirmation does not establish publication readiness. This page works offline and sends no data to a server.</p>
 <p>After editing, download the review file, replace the original review file shown below, and rerun the same analysis command. Regenerate this page after every analysis; an older page contains older evidence.</p>
-<p id="path"></p><div id="rows"></div><button id="save">Download review-decisions.json</button><p id="message" role="status"></p>
+<p id="path"></p><h2>Candidate evidence decisions</h2><div id="rows"></div><h2>Requested changes</h2><p>Rejecting a candidate mapping does not reject its CodeSystem. Choose your intended target and change separately below. Alternative systems require further terminology and steward review.</p><div id="requests"></div><button id="save">Download review-decisions.json</button><p id="message" role="status"></p>
 <script id="data" type="application/json">__REVIEW_DATA__</script>
 <script>
 'use strict';
@@ -14,6 +15,34 @@ const review=payload.review;
 document.getElementById('source').textContent=review.source_system;
 document.getElementById('path').textContent='Replace: '+payload.path;
 function add(parent,tag,text){const e=document.createElement(tag);e.textContent=text;parent.append(e);return e;}
+const decisionControls=[], requestViews=new Map();
+function isMapping(d){return d.decision_kind!=='target-system-suitability';}
+function syncMapping(code,selected){
+ const view=requestViews.get(code);if(!view)return;
+ if(selected&&selected.decision==='confirmed'){
+  let replaced=false;
+  review.decisions.forEach((other,i)=>{if(other!==selected&&other.source_code===code&&other.decision==='confirmed'){other.decision='rejected';decisionControls[i].value='rejected';decisionControls[i].dispatchEvent(new Event('context-refresh'));replaced=true;}});
+  if(replaced){const notice=document.getElementById('notice');notice.textContent='The previous confirmation for '+code+' was marked rejected. Only one candidate can be confirmed per source code.';notice.style.display='block';setTimeout(()=>notice.style.display='none',7000);}
+ }
+ const matches=review.decisions.filter(d=>d.source_code===code&&d.decision==='confirmed');
+ const r=view.request,c=view.source;
+ if(matches.length===1){
+  const d=matches[0],e=d.reviewed_evidence||{};
+  if(!isMapping(d)){
+   Object.assign(r,{target_kind:'existing',target_system:d.target_system,relationship:'different-concept',action:'add',target_code:c.code,display:c.display||'',definition:c.definition||'',rationale:'',system_scope:''});delete r.confirmed_mapping;
+   r.confirmed_suitability={target_system:d.target_system};
+  }else{
+  Object.assign(r,{target_kind:'existing',target_system:d.target_system,relationship:'equivalent',action:'reuse',target_code:d.target_code,display:e.proposed_display||e.target_display||'',definition:e.proposed_definition||e.target_definition||'',rationale:d.note||'Reviewer confirmed equivalence with '+(d.proposal||'the target concept')+'.',system_scope:''});
+  r.confirmed_mapping={proposal:d.proposal,target_system:d.target_system,target_code:d.target_code};
+  delete r.confirmed_suitability;
+  }
+ }else{
+  Object.assign(r,{target_kind:'undecided',target_system:'',relationship:'undecided',action:'investigate',target_code:'',display:c.display||'',definition:c.definition||'',rationale:'',system_scope:''});delete r.confirmed_mapping;delete r.confirmed_suitability;
+ }
+ const locked=matches.length===1&&isMapping(matches[0]);
+ Object.entries(view.controls).forEach(([field,control])=>{control.value=r[field]||'';if(field!=='rationale'){if(control.tagName==='SELECT')control.disabled=locked;else control.readOnly=locked;}});
+ view.lookup();
+}
 review.decisions.forEach((d,i)=>{
  const a=add(document.getElementById('rows'),'article','');
  add(a,'h2',d.source_code+' → '+d.target_code);
@@ -39,9 +68,62 @@ review.decisions.forEach((d,i)=>{
    });
   }
  }
- const label=add(a,'label','Decision ');const select=document.createElement('select');
- ['pending','confirmed','rejected'].forEach(value=>{const o=add(select,'option',value);o.value=value;});select.value=d.decision;label.append(select);select.addEventListener('change',()=>{d.decision=select.value;updateWarning();});
+ const suitability=d.decision_kind==='target-system-suitability';
+ add(a,'p',suitability?'Question: Is this CodeSystem appropriate to investigate this concept? Confirmation does not approve adding a code.':'Question: Does this specific target code represent the source concept as proposed? Rejection does not reject the target system.');
+ const label=add(a,'label',suitability?'System suitability ':'Mapping equivalence ');const select=document.createElement('select');
+ ['pending','confirmed','rejected'].forEach(value=>{const o=add(select,'option',value);o.value=value;});select.value=d.decision;label.append(select);decisionControls[i]=select;select.addEventListener('context-refresh',updateWarning);select.addEventListener('change',()=>{d.decision=select.value;updateWarning();syncMapping(d.source_code,d);});
  const notes=add(a,'label','Review note');const t=document.createElement('textarea');t.value=d.note||'';notes.append(t);t.addEventListener('input',()=>{d.note=t.value;});
+});
+review.change_requests=review.change_requests||[];
+payload.concepts.forEach(c=>{
+ let r=review.change_requests.find(x=>x.source_code===c.code);
+ if(!r){
+  const confirmed=review.decisions.filter((d,i)=>d.source_code===c.code&&payload.statuses[i]==='confirmed');
+  const systems=[...new Set(confirmed.map(d=>d.target_system))];
+  r={source_code:c.code,target_kind:systems.length===1?'existing':'undecided',target_system:systems.length===1?systems[0]:'',relationship:'undecided',action:'investigate',target_code:'',display:c.display||'',definition:c.definition||'',rationale:'',system_scope:'',source_evidence:{code:c.code,display:c.display||null,definition:c.definition||null}};
+  review.change_requests.push(r);
+ }
+ const a=add(document.getElementById('requests'),'article','');add(a,'h3','Requested change for '+c.code);
+ const controls={};
+ const styleNotes={};
+ function codeStyle(v){if(/^\d+$/.test(v))return 'numeric';if(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(v))return 'kebab-case';if(/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(v))return 'snake_case';if(/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(v))return 'UPPER_SNAKE_CASE';if(/^[A-Z][A-Z0-9]*$/.test(v))return 'UPPERCASE';if(/^[a-z][a-z0-9]*$/.test(v))return 'lowercase-single-token';if(/^[a-z][A-Za-z0-9]*$/.test(v))return 'camelCase';if(/^[A-Z][A-Za-z0-9]*$/.test(v))return 'PascalCase-or-capitalized-token';return 'other';}
+ function updateStyles(){const summaries=(payload.target_styles||{})[r.target_system];Object.entries(styleNotes).forEach(([field,node])=>{node.textContent='';if(!summaries||r.action==='reuse')return;let key,observed;if(field==='target_code'){key='code_style';observed=codeStyle(r.target_code);}else if(field==='definition'){key='definition_ending';observed=/[.!?]$/.test((r.definition||'').trim())?'terminal-punctuation':'no-terminal-punctuation';}else{key='display_capitalization';const letters=[...(r.display||'')].filter(x=>/[a-z]/i.test(x));observed=!letters.length?'missing':letters.every(x=>x===x.toUpperCase())?'uppercase':letters.every(x=>x===x.toLowerCase())?'lowercase':letters[0]===letters[0].toUpperCase()?'initial-uppercase':'initial-lowercase';}const summary=summaries[key];if(summary&&summary.pattern!=='insufficient-evidence'&&(!summary.counts[observed]||summary.predominant&&summary.predominant!==observed)){node.textContent='Style review: proposed '+observed+'; target patterns: '+Object.entries(summary.counts).map(([k,v])=>k+' ('+v+')').join(', ')+'. Review target examples; identifiers are not changed automatically.';node.style.color='#8a3800';}});}
+ function choice(field,label,options){const l=add(a,'label',label+' ');const s=document.createElement('select');controls[field]=s;options.forEach(v=>{const o=add(s,'option',v);o.value=v;});s.value=r[field];l.append(s);s.addEventListener('change',()=>r[field]=s.value);}
+ choice('target_kind','Target system',['undecided','existing','new']);
+ choice('relationship','Relationship to existing concept',['undecided','equivalent','needs-modification','different-concept']);
+ choice('action','Requested action',['investigate','reuse','modify','add','create-system']);
+ const targetLabel=add(a,'label','Target CodeSystem — choose a suggestion or enter canonical URL / computable name');
+ const targetInput=document.createElement('input');targetInput.type='text';targetInput.style.width='95%';targetInput.value=r.target_system||'';const listId='targets-'+payload.concepts.indexOf(c);targetInput.setAttribute('list',listId);targetLabel.append(targetInput);
+ const list=add(a,'datalist','');list.id=listId;
+ controls.target_system=targetInput;
+ const suggestions=payload.suggestions[c.code]||{};
+ Object.entries(suggestions).forEach(([url,reasons])=>{const system=payload.catalog.find(x=>x.url===url);const o=add(list,'option','');o.value=url;o.label=(system&&(system.title||system.name)||url)+' · '+[...new Set(reasons)].join(', ');});
+ const lookupMessage=add(a,'p','');lookupMessage.setAttribute('role','status');
+ function lookupTarget(){
+  const value=targetInput.value.trim();r.target_system=value;
+  updateStyles();
+  lookupMessage.style.color='#b00020';
+  if(!value){lookupMessage.textContent='Enter a THO canonical URL or computable name.';return;}
+  const matches=payload.catalog.filter(x=>x.url===value||x.name&&x.name.toLowerCase()===value.toLowerCase());
+  if(matches.length===1){const system=matches[0];r.target_system=system.url;targetInput.value=system.url;updateStyles();lookupMessage.style.color='#174d70';lookupMessage.textContent=(system.title||system.name||system.url)+' · version '+(system.version||'unspecified')+(suggestions[system.url]?' · '+[...new Set(suggestions[system.url])].join(', '):' · found in supplied THO package');return;}
+  if(matches.length>1){lookupMessage.textContent='Computable name is ambiguous. Enter the canonical URL.';return;}
+  if(r.target_kind==='new'&&/^https?:\/\/terminology\.hl7\.org\/CodeSystem\/[^\s/?#]+$/.test(value)){lookupMessage.style.color='#174d70';lookupMessage.textContent='Proposed new THO CodeSystem; not present in the supplied package. Canonical assignment requires review.';return;}
+  lookupMessage.textContent=payload.catalog.length?'CodeSystem not found in the supplied THO package. Enter its exact canonical URL or computable name.':'No THO lookup catalog is available. Rerun analysis with --tho-package-dir.';
+ }
+ targetInput.addEventListener('input',()=>r.target_system=targetInput.value.trim());targetInput.addEventListener('blur',lookupTarget);targetInput.addEventListener('change',lookupTarget);a.addEventListener('change',lookupTarget);if(targetInput.value)lookupTarget();
+ [['target_code','Target code'],['display','Proposed display'],['definition','Proposed definition'],['rationale','Rationale'],['system_scope','Scope of new CodeSystem']].forEach(([field,label])=>{const l=add(a,'label',label);if(field==='display'||field==='definition'){const original=add(l,'small',(field==='display'?'Source display: ':'Source definition: ')+(c[field]||'[Not provided]'));original.style.fontStyle='italic';}const t=document.createElement('textarea');controls[field]=t;t.value=r[field]||'';l.append(t);t.addEventListener('input',()=>r[field]=t.value);});
+ ['target_code','display','definition'].forEach(field=>{styleNotes[field]=add(controls[field].parentElement||a,'small','');controls[field].addEventListener('input',updateStyles);});
+ a.addEventListener('change',updateStyles);updateStyles();
+ requestViews.set(c.code,{request:r,source:c,controls,lookup:lookupTarget});
+ const confirmed=review.decisions.filter((d,i)=>d.source_code===c.code&&payload.statuses[i]==='confirmed');
+ if(confirmed.length===1&&(isMapping(confirmed[0])||!r.confirmed_suitability))syncMapping(c.code,confirmed[0]);
+ if(!confirmed.length&&(r.confirmed_mapping||r.confirmed_suitability))syncMapping(c.code,null);
+ if(confirmed.length>1)add(a,'p','Multiple mappings were confirmed in this older file. Select one mapping above to resolve the conflict.');
+ const current={code:c.code,display:c.display||null,definition:c.definition||null};
+ if(JSON.stringify(current)!==JSON.stringify(r.source_evidence)){
+  add(a,'p','Source evidence changed. Compare your requested wording with the current source before accepting the new baseline.');add(a,'pre',JSON.stringify({saved:r.source_evidence,current},null,2));
+  const l=add(a,'label','');const b=document.createElement('input');b.type='checkbox';l.append(b);l.append(document.createTextNode(' I reviewed this request against the current source.'));const old=r.source_evidence;b.addEventListener('change',()=>r.source_evidence=b.checked?current:old);
+ }
 });
 document.getElementById('save').addEventListener('click',()=>{
  const blob=new Blob([JSON.stringify(review,null,2)+'\n'],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='review-decisions.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);

@@ -15,6 +15,55 @@ SPEC.loader.exec_module(tho_assistant)
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_multiple_confirmed_mappings_are_rejected(self):
+        analysis = tho_assistant.analyze({"url": "urn:source", "concept": [{"code": "local"}]}, Path("source.json"))
+        review = tho_assistant.build_review_template(analysis)
+        review["decisions"] = [{"proposal": key, "source_code": "local", "target_system": "urn:target", "target_code": "target", "decision": "confirmed", "reviewed_evidence": {}} for key in ("UP-1", "UP-2")]
+        with self.assertRaisesRegex(tho_assistant.AnalysisError, "Only one mapping"):
+            tho_assistant.apply_review_decisions(analysis, review)
+
+    def test_catalog_only_includes_tho_and_deduplicates_aliases(self):
+        good = {"url": "http://terminology.hl7.org/CodeSystem/contactentity-type", "name": "ContactEntityType"}
+        bad = {"url": "http://example.org/CodeSystem/local"}
+        with mock.patch.object(tho_assistant, "_index_package_resources", return_value={"canonical": good, "id": good, "bad": bad}):
+            catalog = tho_assistant.tho_catalog(Path("package"))
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["name"], "ContactEntityType")
+        self.assertFalse(tho_assistant.is_tho_canonical("http://terminology.hl7.org.evil/CodeSystem/test"))
+
+    def test_explicit_addition_intent_is_separate_from_mapping(self):
+        source = {"code": "LOCAL", "display": "Local", "definition": "Local concept."}
+        analysis = tho_assistant.analyze({"url": "urn:source", "concept": [source]}, Path("source.json"))
+        review = tho_assistant.build_review_template(analysis)
+        request = {"source_code": "LOCAL", "target_kind": "existing", "target_system": "urn:target", "relationship": "different-concept", "action": "add", "target_code": "local", "display": "Local", "definition": "Local concept.", "rationale": "Distinct contact purpose.", "system_scope": "", "source_evidence": source}
+        review["change_requests"] = [request]
+        request["target_system"] = "http://terminology.hl7.org/CodeSystem/contactentity-type"
+        analysis["tho_code_system_catalog"] = [{"url": request["target_system"]}]
+        tho_assistant.apply_review_decisions(analysis, review)
+        draft = tho_assistant.render_proposal_draft(analysis)
+        self.assertIn("working proposal for steward review", draft)
+        self.assertIn("action: add", draft)
+        request["relationship"] = "equivalent"
+        tho_assistant.apply_review_decisions(analysis, review)
+        self.assertIn("Addition requires", tho_assistant.render_proposal_draft(analysis))
+        request["relationship"] = "different-concept"
+        analysis["concepts"][0]["definition"] = "Changed."
+        self.assertIn("Source evidence changed", tho_assistant.render_proposal_draft(analysis))
+
+    def test_proposal_draft_excludes_rejected_wording_and_blocks_pending(self):
+        analysis = {"metadata": {"url": "urn:source"}, "concepts": [{"code": "local", "display": "Local"}],
+                    "review_decisions": [{"proposal": "UP-814", "source_code": "local", "target_system": "urn:target", "target_code": "target", "effective_status": "confirmed", "reviewed_evidence": {"proposed_display": "Reviewed display", "proposed_definition": "Reviewed definition."}},
+                                         {"proposal": "UP-819", "source_code": "local", "target_system": "urn:other", "target_code": "other", "effective_status": "rejected", "reviewed_evidence": {"proposed_display": "Rejected wording"}}],
+                    "proposal_matches": [{"key": "UP-814", "status": "Content Check"}]}
+        draft = tho_assistant.render_proposal_draft(analysis)
+        self.assertIn("Reviewed definition.", draft)
+        self.assertNotIn("Rejected wording", draft)
+        self.assertIn("do not prepare a duplicate", draft)
+        analysis["review_decisions"][0]["effective_status"] = "requires-re-review"
+        draft = tho_assistant.render_proposal_draft(analysis)
+        self.assertIn("Not ready for proposal wording", draft)
+        self.assertNotIn("Reviewed definition.", draft)
+
     def test_target_style_preserves_existing_and_flags_new_patterns(self):
         inventory = tho_assistant.style_inventory([{"code": c} for c in ("one-code", "two-code", "three-code")])
         self.assertEqual(tho_assistant.target_style_assessment("newCode", None, inventory)["status"], "introduces-new-style")

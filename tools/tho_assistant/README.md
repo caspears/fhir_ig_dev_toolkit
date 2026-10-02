@@ -1,5 +1,85 @@
 # THO Proposal Assistant
 
+Analysis now regenerates `proposal-draft.md` together with the JSON/Markdown
+reports and review page on every run. Save the edited review file and rerun the
+same full analysis command; a separate prepare-proposal call is unnecessary.
+The first-run draft lists unresolved review questions. Subsequent drafts reflect
+the latest review decisions and requested changes. Keep manual draft edits in a
+separate working copy, since generated files are replaced. `prepare-proposal`
+remains available for offline regeneration from saved evidence.
+
+## Confirmed mapping shortcut
+
+Confirming a proposal mapping fills existing system, equivalent relationship,
+reuse action, target canonical/code, and reviewed target display/definition.
+These fields are locked while confirmed; rationale remains editable. Source
+display and definition appear beside their proposed fields. Confirming another
+mapping for the same source moves the previous mapping to pending. Removing the
+confirmation resets the request to undecided/investigate and source wording.
+Current confirmed mappings also populate requests when the page opens; prior
+manual request values are replaced by this shortcut. System-suitability decisions
+do not establish equivalence and do not invoke this behavior. Multiple confirmed
+proposal mappings are rejected by backend validation. Reuse remains subject to
+evidence freshness and publication checks; draft wording may not yet be published.
+
+## THO target selector and lookup
+
+Analysis with `--tho-package-dir` embeds a metadata catalog of only CodeSystems
+whose canonical is under terminology.hl7.org/CodeSystem/. The offline review
+page suggests targets from ValueSet co-inclusion, base bindings, and related
+proposals. Its single target input also accepts any exact THO canonical or a
+case-insensitive computable name from the catalog. On leaving the input it
+resolves the name to canonical and shows title/version; unknown or ambiguous
+entries show a red message immediately below it. Names are exact matches, not
+fuzzy guesses. Lookup is against the supplied package snapshot, not the network.
+
+For older analyses, rerun analysis with the THO package to populate the catalog.
+Alternatively `review --output-dir ... --tho-package-dir ...` refreshes the page
+catalog; rerun analysis before proposal preparation to persist lookup evidence.
+New-system requests require a proposed THO canonical and are labeled unassigned
+proposals rather than missing existing systems. Non-THO targets and unverified
+existing systems remain unresolved in proposal drafts. Canonicals for new
+CodeSystems require steward agreement; selecting a target does not approve codes.
+
+## Explicit targets and change intent
+
+The review page distinguishes candidate mapping equivalence from target-system
+suitability. A separate Requested changes section provides one request per source
+concept: target kind (existing/new/undecided), canonical, relationship, action,
+target identifier, display, definition, rationale, and new-system scope.
+Rejecting a candidate does not reject its system. Choose different-concept + add
+to propose an addition in that system; choose a different canonical for another
+existing system, or new + create-system with a scope for a proposed new system.
+Reuse requires equivalent; modify requires needs-modification. Save using the
+existing download/replace workflow, rerun analysis, then prepare-proposal.
+
+Requests persist separately as change_requests in the review file. Existing
+decisions are preserved. A unique currently confirmed target prepopulates the
+system; action and relationship remain undecided until reviewed. Request baselines
+track source text changes; the UI explicitly accepts a new source baseline.
+Proposal drafts list intent and unresolved fields. Alternative targets and proposed
+codes are not automatically validated against packages or Jira. Related existing
+tickets still require coordination. This increment prepares human working proposals,
+not approved additions or completed UTG submissions.
+
+## Reviewed proposal preparation
+
+Run `python tools/tho_assistant/tho_assistant.py prepare-proposal --output-dir build/tho-analysis/BenefitCostTypeCS`
+after completing review (use your actual directory; custom review paths use
+`--review-file`). This writes `proposal-draft.md` from saved analysis and current
+review decisions, rechecking their baselines. Confirmed proposal mappings include
+reviewed wording and coordination notes for existing tickets. Confirmed system
+suitability includes candidate wording and unresolved target/change questions;
+it never implies a need for additions. Pending, stale, and conflicting decisions
+are marked not ready. Rejected mappings are listed for traceability without
+including their proposed wording. Drafts include binding evidence and remaining
+questions. No Jira submission or FHIR resource generation occurs.
+
+Refresh analysis to obtain current evidence before preparing a draft. This command
+does not contact Jira. Rerunning overwrites `proposal-draft.md`; keep human edits
+in a separate working copy. Proposal drafting is an MVP preparation aid, not an
+automatic completed UTG submission.
+
 ## MVP target style review
 
 With `--tho-package-dir`, discovered target CodeSystems now include a style
