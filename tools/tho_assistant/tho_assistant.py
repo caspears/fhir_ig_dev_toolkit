@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import copy
 import getpass
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +22,9 @@ from xml.etree import ElementTree
 
 
 FHIR_NS = "http://hl7.org/fhir"
+_draft_spec = importlib.util.spec_from_file_location("tho_draft_builds", Path(__file__).with_name("draft_builds.py"))
+draft_builds = importlib.util.module_from_spec(_draft_spec)
+_draft_spec.loader.exec_module(draft_builds)
 METADATA_FIELDS = (
     "id",
     "url",
@@ -586,6 +590,8 @@ def compare_tho_target_artifacts(
                 for code, candidate in candidate_by_code.items():
                     proposed = next((row for row in proposal.get("proposed_concepts", [])
                                      if row["code"] == code), {})
+                    if proposed.get("draft_canonical") and proposed["draft_canonical"] != canonical:
+                        proposed = {}
                     target_code = proposed.get("proposed_code", code)
                     target = target_concepts.get(target_code)
                     concept_results.append(
@@ -617,6 +623,10 @@ def compare_tho_target_artifacts(
         for artifact in artifacts:
             for row in artifact.get("concept_comparison", []):
                 proposed = proposed_by_code.get(row["code"], {})
+                if proposed.get("draft_canonical") and proposed["draft_canonical"] != artifact["canonical"]:
+                    proposed = {}
+                row["proposed_source"] = proposed.get("proposed_source", "jira-text")
+                row["draft_provenance"] = proposed.get("draft_provenance")
                 row["proposal_status"] = proposed.get("status", "not-extracted")
                 row["proposed_display"] = proposed.get("display")
                 row["proposed_definition"] = proposed.get("definition")
@@ -1181,6 +1191,7 @@ def analyze(
     valueset_usage: list[dict[str, Any]] | None = None,
     binding_context: list[dict[str, Any]] | None = None,
     tho_package_dir: Path | None = None,
+    draft_records: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     concepts = _flatten_concepts(
         [item for item in _as_list(resource.get("concept")) if isinstance(item, dict)]
@@ -1200,6 +1211,29 @@ def analyze(
         result["proposal_matches"] = match_proposals(
             resource, concepts, proposal_payloads, valueset_usage, binding_context
         )
+        for proposal in result["proposal_matches"]:
+            records = (draft_records or {}).get(proposal["key"], [])
+            proposal["draft_artifacts"] = records
+            proposal["jira_proposed_concepts"] = copy.deepcopy(proposal["proposed_concepts"])
+            valid = [row for row in records if row.get("resource", {}).get("resourceType") == "CodeSystem"
+                     and row["resource"].get("url") in proposal["target_canonicals"]]
+            for candidate in proposal["proposed_concepts"]:
+                options = []
+                for draft in valid:
+                    for concept in _flatten_concepts(_as_list(draft["resource"].get("concept"))):
+                        if concept.get("code") == candidate["code"] or _mentioned_terms([candidate["code"]], concept.get("display") or ""):
+                            options.append((draft, concept))
+                exact = [option for option in options if option[1]["code"] == candidate["code"]]
+                options = exact or options
+                if len(options) == 1:
+                    draft, concept = options[0]
+                    candidate.update(status="extracted" if exact else "alternate-code-candidate",
+                        proposed_code=concept["code"], display=concept.get("display"), definition=concept.get("definition"),
+                        mapping_status="exact-code" if exact else "requires-review",
+                        proposed_source="draft-build", draft_canonical=draft["resource"]["url"],
+                        draft_provenance={key: draft.get(key) for key in ("url", "status", "retrieved_at", "sha256")})
+                elif len(options) > 1:
+                    candidate.update(status="ambiguous", mapping_status="requires-review")
         if tho_package_dir is not None:
             result["proposal_matches"] = compare_tho_target_artifacts(
                 result["proposal_matches"], concepts, tho_package_dir
@@ -1238,6 +1272,9 @@ def build_review_template(analysis: dict[str, Any]) -> dict[str, Any]:
                     "reviewed_evidence": {key: row.get(key) for key in (
                         "candidate_display", "candidate_definition", "proposed_display", "proposed_definition")},
                 })
+                if row.get("proposed_source") == "draft-build":
+                    decisions[-1]["reviewed_evidence"]["proposed_source"] = "draft-build"
+                    decisions[-1]["reviewed_evidence"]["draft_url"] = (row.get("draft_provenance") or {}).get("url")
     for artifact in analysis.get("context_target_artifacts", []):
         if artifact.get("status") != "found":
             continue
@@ -1277,6 +1314,12 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
         elif (decision.get("reviewed_evidence") != matching[0]["reviewed_evidence"] or
               decision.get("decision_kind") != matching[0].get("decision_kind")):
             status = "requires-re-review"
+        if status == "confirmed":
+            proposal = next((item for item in analysis.get("proposal_matches", []) if item.get("key") == decision.get("proposal")), {})
+            artifact = next((item for item in proposal.get("tho_target_artifacts", []) if item.get("canonical") == decision["target_system"]), {})
+            comparison = next((item for item in artifact.get("concept_comparison", []) if item.get("code") == decision["source_code"]), {})
+            if (comparison.get("draft_provenance") or {}).get("status") == "cached-live-unavailable":
+                status = "requires-re-review"
         results.append({**decision, "effective_status": status})
     analysis["review_decisions"] = results
 
@@ -1429,6 +1472,23 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             lines.append("| " + _escape_table(decision.get("decision_kind", "proposal-mapping")) + " | " + " | ".join(_escape_table(decision.get(key)) for key in
                          ("proposal", "source_code", "target_system", "target_code", "decision", "effective_status", "note")) + " |")
 
+    if any(proposal.get("draft_artifacts") for proposal in analysis.get("proposal_matches", [])):
+        lines.extend(["", "## Draft build evidence", "",
+                      "Draft content is development evidence. Cached snapshots may be older than the current proposal; verify before confirming decisions."])
+        for proposal in analysis["proposal_matches"]:
+            for draft in proposal.get("draft_artifacts", []):
+                lines.extend(["", f"- {proposal['key']}: {draft['action']} `{draft['source_path']}`; status: {draft['status']}; "
+                              f"URL: {draft.get('url', 'not fetched')}; retrieved: {draft.get('retrieved_at', 'unavailable')}; "
+                              f"SHA-256: {draft.get('sha256', 'unavailable')}."])
+            for candidate in proposal.get("proposed_concepts", []):
+                if candidate.get("proposed_source") == "draft-build":
+                    jira = next((row for row in proposal["jira_proposed_concepts"] if row["code"] == candidate["code"]), {})
+                    lines.extend(["", f"- `{candidate['code']}` → `{candidate['proposed_code']}`: proposed values taken from draft JSON.",
+                                  f"  - Jira display: {_escape_table(jira.get('display'))}",
+                                  f"  - Jira definition: {_escape_table(jira.get('definition'))}",
+                                  f"  - Draft display: {_escape_table(candidate.get('display'))}",
+                                  f"  - Draft definition: {_escape_table(candidate.get('definition'))}"])
+
     if "proposal_matches" in analysis:
         lines.extend(["", "## Related THO proposals", ""])
         proposals = analysis["proposal_matches"]
@@ -1530,7 +1590,7 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                                 "| Source | Display | Definition |", "|---|---|---|",
                                 "| IG | " + _escape_table(concept.get("candidate_display")) + " | " + _escape_table(concept.get("candidate_definition")) + " |",
                                 "| Installed THO | " + _escape_table(concept.get("target_display")) + " | " + _escape_table(concept.get("target_definition")) + " |",
-                                "| Jira proposal | " + _escape_table(concept.get("proposed_display")) + " | " + _escape_table(concept.get("proposed_definition")) + " |", "",
+                                ("| Draft build | " if concept.get("proposed_source") == "draft-build" else "| Jira proposal | ") + _escape_table(concept.get("proposed_display")) + " | " + _escape_table(concept.get("proposed_definition")) + " |", "",
                                 f"Extraction: {concept.get('proposal_status')}; inferred change: {concept.get('inferred_change')}.", ""])
                             lines.append(
                                 "  - "
@@ -1728,6 +1788,21 @@ def command_analyze(args: argparse.Namespace) -> int:
                 args.jira_url, jql, token=token, cookie=cookie
             )
         )
+    draft_records = {}
+    if args.fetch_drafts or args.draft_file:
+        relevant_keys = {item["key"] for item in match_proposals(resource,
+            _flatten_concepts(_as_list(resource.get("concept"))), proposal_payloads, valueset_usage, binding_context)}
+        local_files: dict[str, list[Path]] = {}
+        for value in args.draft_file:
+            key, separator, path = value.partition("=")
+            if not separator or not re.fullmatch(r"UP-\d+", key):
+                raise AnalysisError("--draft-file requires UP-number=path/to/Resource.json")
+            local_files.setdefault(key, []).append(Path(path).expanduser().resolve())
+        for payload in proposal_payloads:
+            for issue in _jira_issues(payload):
+                if (args.fetch_drafts and issue.get("key") in relevant_keys) or issue.get("key") in local_files:
+                    draft_records[issue["key"]] = draft_builds.retrieve_drafts(
+                        issue, output_dir / "draft-snapshots", local_files.get(issue["key"], []), allow_fetch=args.fetch_drafts)
     tho_package_dir: Path | None = None
     if args.tho_package_dir:
         tho_package_dir, tho_package_version = resolve_latest_package_dir(
@@ -1746,7 +1821,11 @@ def command_analyze(args: argparse.Namespace) -> int:
         valueset_usage,
         binding_context,
         tho_package_dir,
+        draft_records,
     )
+    if args.search_proposals:
+        result["proposal_search"] = {"jql": jql, "limit": 50, "total": proposal_payloads[-1].get("total"),
+                                     "returned": len(proposal_payloads[-1].get("issues", [])), "pagination": "not-implemented"}
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.review_file and args.write_review_template:
         raise AnalysisError("Use --review-file alone; --write-review-template is deprecated.")
@@ -1773,14 +1852,27 @@ def command_analyze(args: argparse.Namespace) -> int:
         status = decision["effective_status"]
         counts[status] = counts.get(status, 0) + 1
     print("Review status: " + (", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "no extracted mappings available"))
-    print("Next: Review concept-inventory.md. Set applicable pending decisions to confirmed or rejected; optionally add a note.")
-    print("Preserve mapping identities and reviewed_evidence. Save the review file and rerun the same command.")
-    if counts.get("requires-re-review"):
-        print("Changed evidence: compare current findings with the saved baseline before updating reviewed_evidence and reconfirming.")
+    for instruction in review_next_steps(counts):
+        print(instruction)
     print("Keep the review file between runs. Use a separate output directory for each CodeSystem.")
     if args.write_review_template:
         print("--write-review-template is deprecated; use --review-file for this custom path on subsequent runs.")
     return 0
+
+
+def review_next_steps(counts: dict[str, int]) -> list[str]:
+    instructions = []
+    if counts.get("pending"):
+        instructions.append("Next: Review concept-inventory.md. Set applicable pending decisions to confirmed or rejected; optionally add a note.")
+    if counts.get("requires-re-review"):
+        instructions.append("Next: Compare changed evidence in concept-inventory.md with the saved baseline before updating reviewed_evidence and reconfirming or rejecting.")
+    if instructions:
+        instructions.append("Preserve mapping identities. Leave reviewed_evidence unchanged for pending decisions. Save the review file and rerun the same command.")
+    elif counts:
+        instructions.append("Review complete: no pending decisions or changed evidence require review. Next: Follow the recommended actions in concept-inventory.md; verify publication readiness before updating the IG.")
+    else:
+        instructions.append("Next: Review concept-inventory.md for context and discovery findings. No mapping decisions are available; broaden terminology discovery as needed.")
+    return instructions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1798,6 +1890,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test_parser.set_defaults(handler=command_test_jira)
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a candidate CodeSystem")
+    analyze_parser.add_argument("--fetch-drafts", action="store_true", help="Fetch manifest-listed UTG draft artifacts and cache snapshots")
+    analyze_parser.add_argument("--draft-file", action="append", default=[], help="Local draft override UP-number=path/to/Resource.json; repeatable")
     analyze_parser.add_argument("--review-file", type=Path, help="Override the automatic output-dir/review-decisions.json path")
     analyze_parser.add_argument("--write-review-template", type=Path, help="Deprecated alias for a custom review-file path")
     analyze_parser.add_argument("input", type=Path, help="FHIR CodeSystem JSON or XML")

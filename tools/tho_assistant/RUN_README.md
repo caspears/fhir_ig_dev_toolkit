@@ -70,6 +70,7 @@ python tools/tho_assistant/tho_assistant.py analyze `
   --fhir-package-dir ~/.fhir/packages/hl7.fhir.r4.core#4.0.1 `
   --tho-package-dir ~/.fhir/packages/hl7.terminology.r4 `
   --search-proposals `
+  --fetch-drafts `
   --output-dir build/tho-analysis/BenefitCostTypeCS
 ```
 After updating the review file, run again the same way.

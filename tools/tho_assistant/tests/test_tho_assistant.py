@@ -15,6 +15,44 @@ SPEC.loader.exec_module(tho_assistant)
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_review_guidance_tracks_effective_status(self):
+        complete = " ".join(tho_assistant.review_next_steps({"confirmed": 2, "rejected": 2}))
+        self.assertIn("Review complete", complete)
+        self.assertNotIn("rerun", complete)
+        self.assertIn("publication readiness", complete)
+        pending = " ".join(tho_assistant.review_next_steps({"pending": 1}))
+        self.assertIn("confirmed or rejected", pending)
+        changed = " ".join(tho_assistant.review_next_steps({"requires-re-review": 1}))
+        self.assertIn("saved baseline", changed)
+        empty = " ".join(tho_assistant.review_next_steps({}))
+        self.assertIn("No mapping decisions", empty)
+
+    def test_manifest_draft_precedence_and_expired_snapshot(self):
+        issue = {"key": "UP-814", "fields": {
+            "customfield_13305": "| _New:_ | |\n| _Deleted:_ | input/sourceOfTruth/fhir/valueSets/ValueSet-old.xml |\n| _Modified:_ | [input/sourceOfTruth/fhir/codeSystems/CodeSystem-benefit-type.xml|https://example.test/input/sourceOfTruth/fhir/codeSystems/CodeSystem-benefit-type.xml]\n[input/utg.xml|https://example.test/input/utg.xml] |",
+            "customfield_10426": "http://terminology.hl7.org/CodeSystem/benefit-type\ncoinsurance\n\tOld display\n\t\tOld definition."}}
+        manifest = tho_assistant.draft_builds.parse_manifest(issue["fields"]["customfield_13305"])
+        self.assertEqual(len(manifest), 2)
+        self.assertEqual(manifest[0]["action"], "deleted")
+        draft = {"resourceType": "CodeSystem", "id": "benefit-type", "url": "http://terminology.hl7.org/CodeSystem/benefit-type",
+                 "concept": [{"code": "copay-percent", "display": "Percent / Coinsurance", "definition": "New definition."}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "CodeSystem-benefit-type.json"
+            path.write_text(json.dumps(draft), encoding="utf-8")
+            cache = Path(directory) / "cache"
+            records = tho_assistant.draft_builds.retrieve_drafts(issue, cache, [path], allow_fetch=False)
+            self.assertEqual(records[1]["status"], "local-file")
+            self.assertEqual(records[0]["status"], "declared-deleted")
+            result = tho_assistant.analyze({"url": "urn:local", "concept": [{"code": "coinsurance"}]}, Path("input.json"),
+                                          [issue], draft_records={"UP-814": records})
+            proposed = result["proposal_matches"][0]["proposed_concepts"][0]
+            self.assertEqual(proposed["proposed_code"], "copay-percent")
+            self.assertEqual(proposed["definition"], "New definition.")
+            self.assertEqual(result["proposal_matches"][0]["jira_proposed_concepts"][0]["definition"], "Old definition.")
+            with mock.patch.object(tho_assistant.draft_builds.request, "urlopen", side_effect=OSError("unavailable")):
+                cached = tho_assistant.draft_builds.retrieve_drafts(issue, cache)
+            self.assertEqual(cached[1]["status"], "cached-live-unavailable")
+
     def test_context_discovery_without_jira_supports_system_review(self):
         canonical = "http://terminology.hl7.org/CodeSystem/contactentity-type"
         resource = {"resourceType": "CodeSystem", "url": "urn:local", "concept": [

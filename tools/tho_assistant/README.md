@@ -1,5 +1,37 @@
 # THO Proposal Assistant
 
+## Proposal draft builds
+
+Add `--fetch-drafts` to retrieve JSON artifacts listed in Jira Change Objects
+(`customfield_13305`). Only CodeSystem/ValueSet files under
+`input/sourceOfTruth/` are considered; infrastructural files are excluded.
+Multiline New/Modified/Deleted manifest entries are supported. Deleted artifacts
+are recorded without fetching. Fetches use the UP ticket's UTG build URL and
+never receive Jira authentication headers. Only locally matched proposals are
+processed. The current default URL is
+`http://utg-submitter-builds.hl7.org:9876/UP-number/site/en/`.
+
+Draft CodeSystem concepts take precedence over Jira text when resource identity
+and THO target canonical match. Jira-extracted text remains available for
+comparison. JSON records full draft resources, timestamps, URL, and SHA-256;
+Markdown shows provenance and both text sources. Draft ValueSets are captured
+as evidence but do not yet drive recursive ValueSet resolution.
+
+Snapshots are stored under `output-dir/draft-snapshots/UP-number/`. Each run
+attempts refresh. If unavailable, a saved snapshot is labeled
+`cached-live-unavailable`, and confirmed decisions using it require re-review.
+Relevant concept text/source changes also invalidate the review baseline;
+unrelated changes elsewhere in the artifact do not. These snapshots are not
+published THO or approval evidence. Keep them with review files when cleaning
+build output.
+
+For a downloaded draft use `--draft-file UP-814=path/to/CodeSystem-benefit-type.json`.
+This is repeatable and still requires the Jira manifest from live search or
+`--proposal-file`. Without `--fetch-drafts`, this option does not fetch missing
+resources. Different build layouts and draft HTML/XML-only outputs are not yet
+supported. The executed live JQL, result count, and 50-result pagination limit
+are recorded in `analysis.json`.
+
 ## Context-derived THO discovery
 
 With `--tho-package-dir`, THO CodeSystems discovered via ValueSet co-inclusion
@@ -25,6 +57,33 @@ exceptions for medical terms, abbreviations, and terminology identifiers. The UI
 will show suggestions and allow accept/dismiss decisions. Never automatically
 rename codes, especially published identifiers. Spelling review is planned,
 not implemented in this increment.
+
+## Planned code and editorial style review
+
+Implement backend style findings for code, display, and definition, shared by
+CLI reports and the future UI. For an existing target CodeSystem, new codes must
+follow an established style; do not introduce a new style. Report consistent,
+predominant, mixed, or insufficient-evidence patterns with counts and examples.
+For mixed systems, recommend an established pattern supported by the applicable
+concept group; require a reviewer choice when no pattern is clear. Recognize
+PascalCase, camelCase, snake_case, kebab-case, flatcase, UPPERCASE, UPPER_SNAKE_CASE,
+numeric identifiers, and other patterns. Single-word codes can be ambiguous;
+do not force a casing/separator classification unsupported by the examples.
+
+For a new CodeSystem, default new identifiers to lowercase kebab-case (a single
+word needs no hyphen). This is this toolkit's authoring convention, not a claim
+of a universal FHIR requirement. Existing published codes remain unchanged.
+If a local code is mapped to a differently styled THO code, preserve the source
+identifier and record the proposed target identifier as an explicit mapping.
+
+Assess display and definition conventions separately: capitalization (sentence
+case, title case, acronyms), terminal punctuation, and recurring punctuation
+patterns. Preserve legitimate proper names, clinical abbreviations, and symbols.
+Show original text, a suggested revision, the target examples supporting it,
+and the reason. Human review must accept suggestions; do not silently rewrite
+codes or text. Add accept/dismiss and scoped exceptions to the future review UI.
+Run style and spelling review before proposal draft generation. Both features
+are planned, not implemented in this increment.
 
 ## Recommendations and next milestones
 
