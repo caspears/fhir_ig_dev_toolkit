@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>THO mapping review</title>
+<style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#172b3a}article{border:1px solid #bbc;padding:1rem;margin:1rem 0;border-radius:8px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f5f7;padding:1rem}textarea{display:block;width:95%;min-height:4rem}select,button{font:inherit;padding:.5rem}label{display:block;margin:.7rem 0}small{display:block}button{background:#174d70;color:white;border:0;border-radius:4px}</style>
+<h1>THO mapping review</h1><p id="source"></p>
+<p>Review each mapping or system suitability decision. Confirmation does not establish publication readiness. This page works offline and sends no data to a server.</p>
+<p>After editing, download the review file, replace the original review file shown below, and rerun the same analysis command. Regenerate this page after every analysis; an older page contains older evidence.</p>
+<p id="path"></p><div id="rows"></div><button id="save">Download review-decisions.json</button><p id="message" role="status"></p>
+<script id="data" type="application/json">__REVIEW_DATA__</script>
+<script>
+'use strict';
+const payload=JSON.parse(document.getElementById('data').textContent);
+const review=payload.review;
+document.getElementById('source').textContent=review.source_system;
+document.getElementById('path').textContent='Replace: '+payload.path;
+function add(parent,tag,text){const e=document.createElement(tag);e.textContent=text;parent.append(e);return e;}
+review.decisions.forEach((d,i)=>{
+ const a=add(document.getElementById('rows'),'article','');
+ add(a,'h2',d.source_code+' → '+d.target_code);
+ add(a,'p',(d.decision_kind||'proposal-mapping')+' · '+(d.proposal||'IG context'));
+ add(a,'p',d.target_system);
+ const effective=payload.statuses[i];add(a,'p','Effective status: '+effective);
+ const context=payload.contexts[i];
+ if(context){add(a,'h3','Proposal context');add(a,'p','Alignment: '+context.context_alignment+' · score: '+context.context_score+' · assessment: '+context.assessment);const details=add(a,'details','');add(details,'summary','Binding and context evidence');add(details,'pre',JSON.stringify(context.context_evidence,null,2));}
+ const warning=add(a,'p','');warning.setAttribute('role','status');warning.style.color='#8a3800';
+ function updateWarning(){warning.textContent=context&&context.context_alignment==='low'&&d.decision==='confirmed'?'Context review: this confirmed mapping has low context alignment. Check the binding and target purpose and record your rationale. Your decision remains confirmed.':'';}
+ updateWarning();
+ add(a,'h3','Saved evidence');add(a,'pre',JSON.stringify(d.reviewed_evidence,null,2));
+ if(effective==='requires-re-review'||effective==='evidence-unavailable'){
+  add(a,'p','Compare the saved and current evidence before choosing a decision. Editing the decision alone does not accept a changed baseline. Cached or unavailable evidence may still require review after rerunning.');
+  add(a,'h3','Current evidence');add(a,'pre',JSON.stringify(payload.current[i]||null,null,2));
+  if(effective==='requires-re-review'&&payload.current[i]){
+   const baseline=JSON.parse(JSON.stringify(d.reviewed_evidence));const kind=d.decision_kind;
+   const acknowledgement=add(a,'label','');const checkbox=document.createElement('input');checkbox.type='checkbox';acknowledgement.append(checkbox);acknowledgement.append(document.createTextNode(' I compared the evidence and accept the current evidence as the reviewed baseline.'));
+   checkbox.addEventListener('change',()=>{
+    d.reviewed_evidence=JSON.parse(JSON.stringify(checkbox.checked?payload.current[i]:baseline));
+    const selectedKind=checkbox.checked?payload.kinds[i]:kind;
+    if(selectedKind===undefined||selectedKind===null)delete d.decision_kind;else d.decision_kind=selectedKind;
+   });
+  }
+ }
+ const label=add(a,'label','Decision ');const select=document.createElement('select');
+ ['pending','confirmed','rejected'].forEach(value=>{const o=add(select,'option',value);o.value=value;});select.value=d.decision;label.append(select);select.addEventListener('change',()=>{d.decision=select.value;updateWarning();});
+ const notes=add(a,'label','Review note');const t=document.createElement('textarea');t.value=d.note||'';notes.append(t);t.addEventListener('input',()=>{d.note=t.value;});
+});
+document.getElementById('save').addEventListener('click',()=>{
+ const blob=new Blob([JSON.stringify(review,null,2)+'\n'],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='review-decisions.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ document.getElementById('message').textContent='Download requested. Replace the original review file with the downloaded file before rerunning analysis.';
+});
+</script></html>

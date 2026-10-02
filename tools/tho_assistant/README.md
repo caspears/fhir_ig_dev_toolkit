@@ -1,5 +1,50 @@
 # THO Proposal Assistant
 
+## MVP target style review
+
+With `--tho-package-dir`, discovered target CodeSystems now include a style
+inventory of all installed concepts and nested concepts. JSON and Markdown show
+identifier patterns, display capitalization, definition endings, counts, and
+examples. Reuse preserves existing target identifiers. Potential additions are
+flagged when they introduce an unseen pattern; mixed systems and minority styles
+require review of the applicable group. Fewer than three concepts provide
+insufficient evidence. This does not rewrite identifiers or text, establish a
+need for new codes, or assess grammatical sentence/title case.
+
+Immediate MVP priority is reviewed proposal drafting and real-world pilots.
+Advanced matching, dictionaries, spelling correction, detailed editorial checks,
+and UI polish are deferred to refinement cycles.
+
+## Candidate matching
+
+Proposal extraction and draft concept discovery treat capitalization, hyphens,
+underscores, and spaces as equivalent for candidate discovery. Identifiers are
+preserved. Exact codes take priority, then normalized codes, normalized display
+mentions, and fuzzy display comparisons (SequenceMatcher similarity at least
+0.85, with at least four normalized characters). All candidates at the best
+matching tier are retained; multiple candidates remain ambiguous. Similarity
+scores are textual evidence, not semantic confidence. Non-exact candidates
+require human review. Installed-package exact-code comparisons still use the
+proposed target identifier; general package-wide fuzzy discovery is not implemented.
+
+## Offline browser review
+
+After analysis, run `python tools/tho_assistant/tho_assistant.py review --output-dir build/tho-analysis/BenefitCostTypeCS`
+(use your actual analysis output directory). Open the generated `review.html` in
+your browser. Each decision shows its identity, effective status, saved evidence,
+and editable decision and note. Download the edited `review-decisions.json`,
+replace the original file shown in the page, then rerun your analysis command.
+For a custom review path, pass the same `--review-file` to this command.
+
+The page works offline without a server or external assets. It preserves mapping
+identities and does not write directly to your filesystem. Analysis now regenerates
+the page automatically using the selected review file. It is a snapshot, not a
+live view; reopen or refresh it after analysis. Changed evidence appears beside
+the saved baseline. An explicit checkbox accepts current evidence for the downloaded
+file; leaving it unchecked preserves the baseline. This does not bypass cached
+draft or unavailable-evidence checks. Choose confirmed, rejected, or pending
+separately. Input selection and direct saving are future UI increments.
+
 ## Proposal draft builds
 
 Add `--fetch-drafts` to retrieve JSON artifacts listed in Jira Change Objects

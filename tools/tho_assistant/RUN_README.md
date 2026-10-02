@@ -73,4 +73,17 @@ python tools/tho_assistant/tho_assistant.py analyze `
   --fetch-drafts `
   --output-dir build/tho-analysis/BenefitCostTypeCS
 ```
-After updating the review file, run again the same way.
+After updating the review file (or after using the UI to review below), run again the same way for the final choice pages
+
+
+
+
+```shell
+python tools/tho_assistant/tho_assistant.py review `
+  --output-dir build/tho-analysis/BenefitCostTypeCS
+```
+Open the generated review.html. You can read the evidence, select decisions, and edit notes without editing JSON.
+run the previous added review template step
+
+
+

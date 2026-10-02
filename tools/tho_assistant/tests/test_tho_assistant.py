@@ -15,6 +15,62 @@ SPEC.loader.exec_module(tho_assistant)
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_target_style_preserves_existing_and_flags_new_patterns(self):
+        inventory = tho_assistant.style_inventory([{"code": c} for c in ("one-code", "two-code", "three-code")])
+        self.assertEqual(tho_assistant.target_style_assessment("newCode", None, inventory)["status"], "introduces-new-style")
+        self.assertEqual(tho_assistant.target_style_assessment("new-code", None, inventory)["status"], "matches-established-style")
+        self.assertEqual(tho_assistant.target_style_assessment("co-pay", {"code": "copay"}, inventory)["identifier"], "copay")
+
+    def test_normalized_and_fuzzy_discovery_with_ambiguity(self):
+        targets = [{"code": "copay", "display": "CoPay"}, {"code": "copay-percent", "display": "Copayment Percent / Coinsurance"}]
+        match = tho_assistant.discover_concept_candidates({"code": "CO_pay", "display": "copay"}, targets)
+        self.assertEqual(match[0]["method"], "normalized-code")
+        self.assertEqual(match[0]["concept"]["code"], "copay")
+        match = tho_assistant.discover_concept_candidates({"code": "co-insurance"}, targets)
+        self.assertEqual(match[0]["concept"]["code"], "copay-percent")
+        match = tho_assistant.discover_concept_candidates({"code": "local", "display": "Marketting"}, [{"code": "marketing", "display": "Marketing"}])
+        self.assertEqual(match[0]["method"], "fuzzy-display")
+        self.assertEqual(len(tho_assistant.discover_concept_candidates({"code": "co-pay"}, [{"code": "copay"}, {"code": "CO_PAY"}])), 2)
+        self.assertEqual(tho_assistant.discover_concept_candidates({"code": "cap"}, [{"code": "copay"}]), [])
+
+    def test_style_inventory_preserves_codes_and_handles_ambiguity(self):
+        examples = {"some-code": "kebab-case", "some_code": "snake_case", "SOME_CODE": "UPPER_SNAKE_CASE", "someCode": "camelCase", "SomeCode": "PascalCase-or-capitalized-token", "abc": "lowercase-single-token", "ABC": "UPPERCASE", "123": "numeric", "a.b": "other"}
+        for code, expected in examples.items():
+            self.assertEqual(tho_assistant.code_style(code), expected)
+        concepts = [{"code": c, "display": "Example", "definition": "Example."} for c in ("one-code", "two-code", "three-code")]
+        inventory = tho_assistant.style_inventory(concepts)
+        self.assertEqual(inventory["summaries"]["code_style"]["pattern"], "consistent")
+        self.assertEqual([r["code"] for r in inventory["concepts"]], [c["code"] for c in concepts])
+        self.assertEqual(tho_assistant.style_inventory(concepts[:2])["summaries"]["code_style"]["pattern"], "insufficient-evidence")
+
+    def test_low_context_confirmation_warns_without_overriding_review(self):
+        analysis = {"concepts": [{"code": "copay"}], "review_decisions": [
+            {"source_code": "copay", "proposal": "UP-819", "target_system": "urn:target", "target_code": "copay", "effective_status": "confirmed"}],
+            "proposal_matches": [{"key": "UP-819", "context_alignment": "low"}]}
+        row = tho_assistant.build_recommendations(analysis)[0]
+        self.assertEqual(row["action"], "coordinate-with-existing-proposal")
+        self.assertIn("low context alignment", row["context_warnings"][0])
+        self.assertEqual(analysis["review_decisions"][0]["effective_status"], "confirmed")
+        analysis["proposal_matches"][0]["context_alignment"] = "high"
+        self.assertEqual(tho_assistant.build_recommendations(analysis)[0]["context_warnings"], [])
+
+    def test_offline_review_preserves_json_and_escapes_evidence(self):
+        analysis = tho_assistant.analyze({"url": "urn:local", "concept": [{"code": "x"}]}, Path("input.json"))
+        review = tho_assistant.build_review_template(analysis)
+        review["source_system"] = analysis["metadata"]["url"] = "urn:</script><script>alert(1)</script>"
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "analysis.json").write_text(json.dumps(analysis))
+            original = json.dumps(review)
+            (folder / "review-decisions.json").write_text(original)
+            args = tho_assistant.argparse.Namespace(output_dir=folder, review_file=None)
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                tho_assistant.command_review(args)
+            html = (folder / "review.html").read_text()
+            self.assertNotIn("urn:</script>", html)
+            self.assertIn("\\u003c/script", html)
+            self.assertEqual((folder / "review-decisions.json").read_text(), original)
+
     def test_review_guidance_tracks_effective_status(self):
         complete = " ".join(tho_assistant.review_next_steps({"confirmed": 2, "rejected": 2}))
         self.assertIn("Review complete", complete)

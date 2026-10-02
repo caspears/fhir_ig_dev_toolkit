@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import getpass
 import importlib.util
 import json
@@ -587,6 +588,9 @@ def compare_tho_target_artifacts(
                     if isinstance(concept.get("code"), str)
                 }
                 concept_results: list[dict[str, Any]] = []
+                result["style_review"] = style_inventory(list(target_concepts.values()))
+                result["style_review"]["scope"] = "installed-target-CodeSystem"
+                result["style_review"]["note"] = "Installed target inventory; existing codes are preserved. Addition style assessments require human review."
                 for code, candidate in candidate_by_code.items():
                     proposed = next((row for row in proposal.get("proposed_concepts", [])
                                      if row["code"] == code), {})
@@ -594,10 +598,12 @@ def compare_tho_target_artifacts(
                         proposed = {}
                     target_code = proposed.get("proposed_code", code)
                     target = target_concepts.get(target_code)
+                    style_assessment = target_style_assessment(target_code, target, result["style_review"])
                     concept_results.append(
                         {
                             "code": code,
                             "target_code": target_code,
+                            "style_assessment": style_assessment,
                             "mapping_status": proposed.get("mapping_status", "unresolved"),
                             "status": "existing-code" if target else "absent-code",
                             "candidate_display": candidate.get("display"),
@@ -849,11 +855,50 @@ def _mentioned_terms(terms: list[str], text: str) -> list[str]:
     return [
         term for term in terms
         if re.search(
-            rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])",
+            rf"(?<![A-Za-z0-9_-]){_discovery_pattern(term)}(?![A-Za-z0-9_-])",
             text,
             flags=re.IGNORECASE,
         )
     ]
+
+
+def _discovery_pattern(term: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", term):
+        return r"[-_\s]*".join(re.escape(c) for c in re.sub(r"[-_]", "", term))
+    return re.escape(term)
+
+
+def normalized_identifier(value: str) -> str:
+    return re.sub(r"[-_\s]+", "", value).casefold()
+
+
+def discover_concept_candidates(source: dict[str, Any], targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matches = []
+    for target in targets:
+        code = source.get("code") or ""
+        target_code = target.get("code") or ""
+        score = 1.0
+        if code and code == target_code:
+            method, rank = "exact-code", 0
+        elif code and normalized_identifier(code) == normalized_identifier(target_code):
+            method, rank = "normalized-code", 1
+        elif code and _mentioned_terms([code], target.get("display") or ""):
+            method, rank = "normalized-display-mention", 2
+        else:
+            display = source.get("display") or ""
+            left = normalized_identifier(display)
+            right = normalized_identifier(target.get("display") or "")
+            if min(len(left), len(right)) < 4:
+                continue
+            score = difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
+            if score < .85:
+                continue
+            method, rank = "fuzzy-display", 3
+        matches.append({"concept": target, "method": method, "score": round(score, 3), "rank": rank})
+    if not matches:
+        return []
+    best_rank = min(m["rank"] for m in matches)
+    return [m for m in matches if m["rank"] == best_rank]
 
 
 CONTEXT_STOP_WORDS = {
@@ -1041,15 +1086,17 @@ def extract_proposed_concepts(fields: dict[str, Any], codes: list[str] | None) -
     return results
 
 
-def map_proposed_concepts(fields: dict[str, Any], codes: list[str]) -> list[dict[str, Any]]:
+def map_proposed_concepts(fields: dict[str, Any], codes: list[str], concepts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     all_rows = extract_proposed_concepts(fields, None)
     results = extract_proposed_concepts(fields, codes)
     for result in results:
         if result["status"] != "not-extracted":
             continue
         # A display mention is a discovery signal, not proof of equivalence.
-        candidates = [row for row in all_rows if row["status"] == "extracted"
-                      and _mentioned_terms([result["code"]], row["display"])]
+        source = next((c for c in (concepts or []) if c.get("code") == result["code"]), {"code": result["code"]})
+        matches = discover_concept_candidates(source, [r for r in all_rows if r["status"] == "extracted"])
+        candidates = [m["concept"] for m in matches]
+        result["match_evidence"] = [{"target_code": m["concept"]["code"], "method": m["method"], "score": m["score"]} for m in matches]
         result["alternate_candidates"] = candidates
         if len(candidates) == 1:
             row = candidates[0]
@@ -1155,7 +1202,7 @@ def match_proposals(
                         else resolution
                     ),
                     "coverage": coverage,
-                    "proposed_concepts": map_proposed_concepts(fields, candidate_codes),
+                    "proposed_concepts": map_proposed_concepts(fields, candidate_codes, concepts),
                     "all_proposed_concepts": extract_proposed_concepts(fields, None),
                     "code_mention_coverage": code_coverage,
                     "code_coverage": code_coverage,
@@ -1184,6 +1231,75 @@ def match_proposals(
     )
 
 
+def code_style(code: str) -> str:
+    if re.fullmatch(r"[0-9]+", code):
+        return "numeric"
+    for pattern, label in ((r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+", "kebab-case"),
+                           (r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", "snake_case"),
+                           (r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", "UPPER_SNAKE_CASE")):
+        if re.fullmatch(pattern, code):
+            return label
+    if re.fullmatch(r"[A-Z][A-Z0-9]*", code):
+        return "UPPERCASE"
+    if re.fullmatch(r"[a-z][a-z0-9]*", code):
+        return "lowercase-single-token"
+    if re.fullmatch(r"[a-z][A-Za-z0-9]*", code) and re.search(r"[A-Z]", code):
+        return "camelCase"
+    if re.fullmatch(r"[A-Z][A-Za-z0-9]*", code):
+        return "PascalCase-or-capitalized-token"
+    return "other"
+
+
+def style_inventory(concepts: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = []
+    for concept in concepts:
+        display = concept.get("display") or ""
+        definition = (concept.get("definition") or "").strip()
+        letters = [c for c in display if c.isalpha()]
+        capitalization = ("missing" if not letters else "uppercase" if all(c.isupper() for c in letters)
+                          else "lowercase" if all(c.islower() for c in letters) else
+                          "initial-uppercase" if letters[0].isupper() else "initial-lowercase")
+        rows.append({"code": concept["code"], "code_style": code_style(concept["code"]),
+                     "display_capitalization": capitalization,
+                     "definition_ending": "missing" if not definition else
+                     "terminal-punctuation" if definition[-1] in ".!?" else "no-terminal-punctuation"})
+    summaries = {}
+    for field in ("code_style", "display_capitalization", "definition_ending"):
+        counts = {}
+        for row in rows:
+            counts[row[field]] = counts.get(row[field], 0) + 1
+        eligible = {k: v for k, v in counts.items() if k != "missing"}
+        total = sum(eligible.values())
+        predominant = max(eligible, key=eligible.get) if eligible else None
+        pattern = ("insufficient-evidence" if total < 3 else "consistent" if len(eligible) == 1
+                   else "predominant" if eligible[predominant] / total >= .8 else "mixed")
+        summaries[field] = {"counts": counts, "pattern": pattern,
+                            "predominant": predominant if pattern in {"consistent", "predominant"} else None,
+                            "examples": {k: [r["code"] for r in rows if r[field] == k][:3] for k in counts}}
+    return {"scope": "source-CodeSystem", "summaries": summaries, "concepts": rows,
+            "note": "Descriptive inventory only. Single-token casing is ambiguous; capitalization is not a grammatical title/sentence-case assessment. Existing identifiers remain unchanged. Spelling checks are not yet implemented."}
+
+
+def target_style_assessment(code: str, existing: dict[str, Any] | None, inventory: dict[str, Any]) -> dict[str, Any]:
+    if existing is not None:
+        return {"status": "preserve-existing-code", "identifier": existing["code"],
+                "reason": "Reuse preserves the existing target identifier, regardless of source naming style."}
+    summary = inventory["summaries"]["code_style"]
+    observed = code_style(code)
+    if summary["pattern"] == "insufficient-evidence":
+        status = "insufficient-evidence"
+    elif observed not in summary["counts"]:
+        status = "introduces-new-style"
+    elif summary["pattern"] == "mixed":
+        status = "established-style-review-group"
+    elif observed != summary["predominant"]:
+        status = "established-minority-style"
+    else:
+        status = "matches-established-style"
+    return {"status": status, "identifier": code, "observed_style": observed,
+            "reason": "Potential addition only; review target examples and the applicable concept group. This finding does not establish that a new code is needed."}
+
+
 def analyze(
     resource: dict[str, Any],
     source: Path,
@@ -1206,6 +1322,7 @@ def analyze(
         "concept_count": len(concepts),
         "concepts": concepts,
         "review_flags": _review_flags(resource, concepts),
+        "style_review": style_inventory(concepts),
     }
     if proposal_payloads:
         result["proposal_matches"] = match_proposals(
@@ -1218,11 +1335,15 @@ def analyze(
             valid = [row for row in records if row.get("resource", {}).get("resourceType") == "CodeSystem"
                      and row["resource"].get("url") in proposal["target_canonicals"]]
             for candidate in proposal["proposed_concepts"]:
-                options = []
+                pool = []
                 for draft in valid:
                     for concept in _flatten_concepts(_as_list(draft["resource"].get("concept"))):
-                        if concept.get("code") == candidate["code"] or _mentioned_terms([candidate["code"]], concept.get("display") or ""):
-                            options.append((draft, concept))
+                        pool.append({**concept, "_draft": draft})
+                source_concept = next(c for c in concepts if c["code"] == candidate["code"])
+                matches = discover_concept_candidates(source_concept, pool)
+                options = [(m["concept"]["_draft"], m["concept"]) for m in matches]
+                if matches:
+                    candidate["match_evidence"] = [{"target_code": m["concept"]["code"], "method": m["method"], "score": m["score"]} for m in matches]
                 exact = [option for option in options if option[1]["code"] == candidate["code"]]
                 options = exact or options
                 if len(options) == 1:
@@ -1233,7 +1354,8 @@ def analyze(
                         proposed_source="draft-build", draft_canonical=draft["resource"]["url"],
                         draft_provenance={key: draft.get(key) for key in ("url", "status", "retrieved_at", "sha256")})
                 elif len(options) > 1:
-                    candidate.update(status="ambiguous", mapping_status="requires-review")
+                    candidate.update(status="ambiguous", mapping_status="requires-review",
+                                     alternate_candidates=[{k: c.get(k) for k in ("code", "display", "definition")} for _, c in options])
         if tho_package_dir is not None:
             result["proposal_matches"] = compare_tho_target_artifacts(
                 result["proposal_matches"], concepts, tho_package_dir
@@ -1404,7 +1526,13 @@ def build_recommendations(analysis: dict[str, Any]) -> list[dict[str, Any]]:
                          "target_system": decision["target_system"], "target_code": decision["target_code"],
                          "installed_code_status": comparison.get("status"),
                          "proposed_change": comparison.get("inferred_change")})
+        warnings = []
+        for decision in confirmed:
+            proposal = next((p for p in analysis.get("proposal_matches", []) if p.get("key") == decision.get("proposal")), {})
+            if proposal.get("context_alignment") == "low":
+                warnings.append(f"{decision['proposal']}: confirmed mapping has low context alignment. Review the binding and target purpose and record your rationale; the saved decision remains confirmed.")
         results.append({"source_code": code, "action": action, "reason": reason,
+                        "context_warnings": warnings,
                         "confirmed_evidence": refs,
                         "publication_readiness": "not-established",
                         "publication_check": "Verify the required target display and definition in the intended published THO version before updating the IG. Jira status and confirmed mappings alone do not establish publication readiness."})
@@ -1440,12 +1568,37 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             lines.append("| " + " | ".join(_escape_table(recommendation[key]) for key in
                          ("source_code", "action", "reason")) + " |")
         for recommendation in analysis["recommendations"]:
+            for warning in recommendation.get("context_warnings", []):
+                lines.extend(["", f"- Context review for `{recommendation['source_code']}`: {_escape_table(warning)}"])
             for evidence in recommendation["confirmed_evidence"]:
                 lines.extend(["", f"- `{recommendation['source_code']}` → `{evidence['target_system']}#{evidence['target_code']}`: "
                               f"{evidence['proposal']} ({evidence.get('proposal_status')}); "
                               f"installed target: {evidence.get('installed_code_status')}; "
                               f"proposed change: {evidence.get('proposed_change')}."])
         lines.extend(["", "Publication readiness is not established. Verify the required target display and definition in the intended published THO version before updating the IG. Jira status and mapping confirmation alone are insufficient."])
+
+    if "style_review" in analysis:
+        style = analysis["style_review"]
+        lines.extend(["", "## Source style inventory", "", style["note"], "",
+                      "Patterns require at least three observations; predominant means at least 80% of observations.", "",
+                      "| Component | Pattern | Counts |", "|---|---|---|"])
+        for field, summary in style["summaries"].items():
+            lines.append("| " + " | ".join(_escape_table(value) for value in (field, summary["pattern"], json.dumps(summary["counts"]))) + " |")
+        lines.extend(["", "| Code | Identifier pattern | Display capitalization | Definition ending |", "|---|---|---|---|"])
+        for row in style["concepts"]:
+            lines.append("| " + " | ".join(_escape_table(row[k]) for k in ("code", "code_style", "display_capitalization", "definition_ending")) + " |")
+
+    targets = list(analysis.get("context_target_artifacts", [])) + [a for p in analysis.get("proposal_matches", []) for a in p.get("tho_target_artifacts", [])]
+    styled = {a["canonical"]: a for a in targets if a.get("style_review")}
+    if styled:
+        lines.extend(["", "## Installed target style review", "", "Descriptive style checks use the installed target package, including all nested concepts. Existing target identifiers remain unchanged. Potential additions require human review; no identifiers or text are rewritten."])
+        for canonical, artifact in styled.items():
+            lines.extend(["", f"### {canonical}", "", f"Artifact version: {artifact.get('version')}; source: {artifact.get('source')}", "", "| Component | Pattern | Counts and examples |", "|---|---|---|"])
+            for field, summary in artifact["style_review"]["summaries"].items():
+                lines.append("| " + " | ".join(_escape_table(x) for x in (field, summary["pattern"], json.dumps({"counts": summary["counts"], "examples": summary["examples"]}))) + " |")
+            for row in artifact.get("concept_comparison", []):
+                assessment = row.get("style_assessment", {})
+                lines.append(f"- `{row['code']}` → `{row['target_code']}`: {assessment.get('status')}. {assessment.get('reason', '')}")
 
     if "context_target_artifacts" in analysis:
         lines.extend(["", "## THO targets discovered from IG context", "",
@@ -1578,6 +1731,8 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                     for evidence in proposed.get("evidence", []):
                         lines.append(f"- Extraction evidence for `{proposed['code']}`: "
                                      f"{evidence['source_field']}, line {evidence['source_line']}.")
+                    for evidence in proposed.get("match_evidence", []):
+                        lines.append(f"- Discovery for `{proposed['code']}` → `{evidence['target_code']}`: {evidence['method']}; score={evidence['score']} (similarity, not semantic confidence).")
                 for artifact in proposal.get("tho_target_artifacts", []):
                     lines.append(
                         f"- `{_escape_table(artifact.get('canonical'))}` "
@@ -1857,6 +2012,7 @@ def command_analyze(args: argparse.Namespace) -> int:
     print("Keep the review file between runs. Use a separate output directory for each CodeSystem.")
     if args.write_review_template:
         print("--write-review-template is deprecated; use --review-file for this custom path on subsequent runs.")
+    command_review(argparse.Namespace(output_dir=output_dir, review_file=review_path))
     return 0
 
 
@@ -1873,6 +2029,34 @@ def review_next_steps(counts: dict[str, int]) -> list[str]:
     else:
         instructions.append("Next: Review concept-inventory.md for context and discovery findings. No mapping decisions are available; broaden terminology discovery as needed.")
     return instructions
+
+
+def command_review(args: argparse.Namespace) -> int:
+    directory = args.output_dir.expanduser().resolve()
+    review_path = (args.review_file or directory / "review-decisions.json").expanduser().resolve()
+    try:
+        analysis = json.loads((directory / "analysis.json").read_text(encoding="utf-8"))
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AnalysisError(f"Cannot load analysis and review files: {error}") from error
+    apply_review_decisions(analysis, review)
+    current = build_review_template(analysis)["decisions"]
+    identity = lambda d: tuple(d.get(k) for k in ("proposal", "source_code", "target_system", "target_code"))
+    payload = {"review": review, "path": str(review_path),
+               "contexts": [next(({k: p.get(k) for k in ("context_alignment", "context_score", "context_evidence", "assessment")} for p in analysis.get("proposal_matches", []) if p.get("key") == d.get("proposal")), None) for d in review["decisions"]],
+               "kinds": [next((c.get("decision_kind") for c in current if identity(c) == identity(d)), None) for d in review["decisions"]],
+               "statuses": [d["effective_status"] for d in analysis["review_decisions"]],
+               "current": [next((c["reviewed_evidence"] for c in current if identity(c) == identity(d)), None) for d in review["decisions"]]}
+    # Prevent embedded evidence from closing the inert JSON script element.
+    data = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    template = Path(__file__).with_name("review.html").read_text(encoding="utf-8")
+    destination = directory / "review.html"
+    if destination == review_path:
+        raise AnalysisError("Review JSON and browser page must use separate paths.")
+    destination.write_text(template.replace("__REVIEW_DATA__", data), encoding="utf-8")
+    print(f"Open in your browser: {destination}")
+    print(f"Download edited decisions and replace {review_path}; then rerun analysis.")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1935,6 +2119,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Jira base URL (default: https://jira.hl7.org)",
     )
     analyze_parser.set_defaults(handler=command_analyze)
+    review_parser = subparsers.add_parser("review", help="Create an offline browser review page")
+    review_parser.add_argument("--output-dir", required=True, type=Path)
+    review_parser.add_argument("--review-file", type=Path)
+    review_parser.set_defaults(handler=command_review)
     return parser
 
 
