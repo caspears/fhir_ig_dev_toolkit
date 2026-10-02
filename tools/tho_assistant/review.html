@@ -75,6 +75,7 @@ review.decisions.forEach((d,i)=>{
  const notes=add(a,'label','Review note');const t=document.createElement('textarea');t.value=d.note||'';notes.append(t);t.addEventListener('input',()=>{d.note=t.value;});
 });
 review.change_requests=review.change_requests||[];
+const rationaleLabel=add(document.getElementById('requests'),'label','Shared proposal rationale (optional)');const sharedRationale=document.createElement('textarea');sharedRationale.value=review.proposal_rationale||'';rationaleLabel.append(sharedRationale);sharedRationale.addEventListener('input',()=>review.proposal_rationale=sharedRationale.value);
 payload.concepts.forEach(c=>{
  let r=review.change_requests.find(x=>x.source_code===c.code);
  if(!r){

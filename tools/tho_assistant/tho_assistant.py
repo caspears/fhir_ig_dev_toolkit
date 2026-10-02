@@ -1476,6 +1476,9 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
             if not isinstance(item.get(field, ""), str):
                 raise AnalysisError(f"Change request {field} must be text.")
     analysis["change_requests"] = copy.deepcopy(requests)
+    if not isinstance(review.get("proposal_rationale", ""), str):
+        raise AnalysisError("Shared proposal rationale must be text.")
+    analysis["proposal_rationale"] = review.get("proposal_rationale", "")
 
 
 def maintain_review_file(analysis: dict[str, Any], path: Path) -> tuple[bool, int]:
@@ -2018,7 +2021,7 @@ def command_analyze(args: argparse.Namespace) -> int:
         raise AnalysisError("Use --review-file alone; --write-review-template is deprecated.")
     review_path = (args.review_file or args.write_review_template or
                    (output_dir / "review-decisions.json")).expanduser().resolve()
-    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", output_dir / "proposal-draft.md", output_dir / "review.html", source}:
+    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", output_dir / "proposal-draft.md", output_dir / "proposal-submission.md", output_dir / "proposal-changes.json", output_dir / "review.html", source}:
         raise AnalysisError("The review file must be separate from the input and generated reports.")
     created, added = maintain_review_file(result, review_path)
     result["recommendations"] = build_recommendations(result)
@@ -2028,7 +2031,7 @@ def command_analyze(args: argparse.Namespace) -> int:
     (output_dir / "concept-inventory.md").write_text(
         render_markdown(result), encoding="utf-8"
     )
-    (output_dir / "proposal-draft.md").write_text(render_proposal_draft(result), encoding="utf-8")
+    write_proposal_outputs(result, output_dir)
     print(f"Analyzed {result['concept_count']} concepts from {source}")
     print(f"Wrote {output_dir / 'analysis.json'}")
     print(f"Wrote {output_dir / 'concept-inventory.md'}")
@@ -2065,7 +2068,7 @@ def review_next_steps(counts: dict[str, int]) -> list[str]:
     return instructions
 
 
-def render_proposal_draft(analysis: dict[str, Any]) -> str:
+def render_proposal_draft(analysis: dict[str, Any], prepared: list[dict[str, Any]] | None = None) -> str:
     recommendations = build_recommendations(analysis)
     lines = ["# THO proposal preparation draft", "",
              "Working draft for human review. No Jira submission or THO approval is implied.", "",
@@ -2111,6 +2114,7 @@ def render_proposal_draft(analysis: dict[str, Any]) -> str:
         lines.extend(["", "### Decisions included", ""])
         lines.extend(f"- {d.get('proposal') or 'Target suitability'}: {d.get('effective_status')}; target `{d['target_system']}#{d['target_code']}`." for d in decisions)
     lines.extend(["", "## Explicit requested changes", "", "These are reviewer-authored intentions, separate from candidate mapping decisions. Alternative targets have not automatically been searched or validated."])
+    grouped = {}
     for item in analysis.get("change_requests", []):
         source = next((c for c in analysis["concepts"] if c["code"] == item["source_code"]), None)
         issues = []
@@ -2125,8 +2129,8 @@ def render_proposal_draft(analysis: dict[str, Any]) -> str:
             issues.append("Source evidence changed or is unavailable; review this request again.")
         if item["target_kind"] == "undecided" or item["action"] == "investigate":
             issues.append("Target or action remains undecided.")
-        if not item.get("target_system") or not item.get("rationale"):
-            issues.append("Provide the target canonical and rationale.")
+        if not item.get("target_system"):
+            issues.append("Provide the target canonical.")
         if item.get("target_system") and not is_tho_canonical(item["target_system"]):
             issues.append("Target must be a terminology.hl7.org CodeSystem canonical URL.")
         if item["target_kind"] == "existing" and item.get("target_system") not in {s["url"] for s in analysis.get("tho_code_system_catalog", [])}:
@@ -2147,16 +2151,81 @@ def render_proposal_draft(analysis: dict[str, Any]) -> str:
         for field in ("target_kind", "target_system", "relationship", "action", "target_code", "display", "definition", "rationale", "system_scope"):
             lines.append(f"- {field}: {_escape_table(item.get(field)) or '[Unspecified]'}")
         lines.extend(f"- Unresolved: {issue}" for issue in issues)
+        if not item.get("rationale") and not analysis.get("proposal_rationale"):
+            lines.append("- Rationale not provided (optional).")
+        if not issues:
+            grouped.setdefault((item["target_system"], item["action"] == "reuse"), []).append(item)
+        if prepared is not None:
+            prepared.append({"request": copy.deepcopy(item), "issues": issues})
+    lines.extend(["", "## Proposal wording grouped by target", "", "Reviewer-authored working content. Reuse mappings are listed separately from requested terminology changes. Entries with unresolved issues above are excluded."])
+    if analysis.get("proposal_rationale"):
+        lines.extend(["", "Shared rationale: " + _escape_table(analysis["proposal_rationale"])])
+    for (canonical, reuse), items in grouped.items():
+        lines.extend(["", f"### {canonical}", "", "Reuse mappings — no terminology change requested." if reuse else "Requested terminology changes — review with the CodeSystem steward.", "",
+                      "| Action | Code | Display | Definition | Source code |", "|---|---|---|---|---|"])
+        for item in items:
+            lines.append("| " + " | ".join(_escape_table(item.get(k)) for k in ("action", "target_code", "display", "definition", "source_code")) + " |")
+        for rationale in dict.fromkeys(item.get("rationale", "") for item in items):
+            if rationale:
+                lines.append("- Rationale: " + _escape_table(rationale))
+        tickets = sorted({d["proposal"] for d in analysis.get("review_decisions", []) if d.get("proposal") and d.get("effective_status") == "confirmed" and d.get("target_system") == canonical and d.get("source_code") in {item["source_code"] for item in items}})
+        if tickets:
+            lines.append("- Coordinate with existing proposal(s): " + ", ".join(tickets) + ".")
     lines.extend(["", "## IG usage evidence", ""])
     for profile in analysis.get("binding_context", []):
         for binding in profile.get("bindings", []):
             lines.append(f"- Profile: {profile.get('url') or profile.get('id')}; element: {binding.get('path')}; ValueSet: {binding.get('value_set')}; strength: {binding.get('strength')}.")
     lines.extend(["", "## Complete before submission or IG changes", "",
-                  "- Confirm the requested change and rationale with the target CodeSystem steward; resolve all placeholders.",
+                  "- Confirm the requested change with the target CodeSystem steward; resolve required wording and target questions. Rationale is optional context.",
                   "- Verify existing terminology and related proposals; absent exact codes do not establish a need for additions.",
                   "- Review display, definition, spelling, identifier style, and ValueSet scope. Automated quality review is incomplete.",
                   "- Verify published target content in the intended THO release before changing the IG.", ""])
     return "\n".join(lines)
+
+
+def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
+    prepared = []
+    dossier = render_proposal_draft(analysis, prepared)
+    groups = {}
+    for row in prepared:
+        item = row["request"]
+        if not row["issues"] and item["action"] != "reuse":
+            groups.setdefault(item["target_system"], []).append(item)
+    submission = ["# Proposed THO terminology changes", "", "Prepared for human submission review. No ticket has been created."]
+    if analysis.get("proposal_rationale"):
+        submission.extend(["", "## Rationale", "", _escape_table(analysis["proposal_rationale"])])
+    if not groups:
+        submission.extend(["", "No complete terminology change requests are available. Reuse mappings do not request THO changes. See proposal-draft.md for review findings."])
+    for canonical, items in groups.items():
+        submission.extend(["", f"## {canonical}", "", "Requested changes:", "", "| Action | Code | Display | Definition |", "|---|---|---|---|"])
+        for item in items:
+            submission.append("| " + " | ".join(_escape_table(item.get(k)) for k in ("action", "target_code", "display", "definition")) + " |")
+        for scope in dict.fromkeys(item.get("system_scope", "") for item in items):
+            if scope:
+                submission.append("\nNew CodeSystem scope: " + _escape_table(scope))
+        for rationale in dict.fromkeys(item.get("rationale", "") for item in items):
+            if rationale:
+                submission.append("\nRationale: " + _escape_table(rationale))
+        related = [p for p in analysis.get("proposal_matches", []) if canonical in p.get("target_canonicals", [])]
+        if related:
+            submission.extend(["", "Related proposals to check before creating a ticket:"])
+            submission.extend(f"- {p['key']} ({p.get('status', 'unknown')}): https://jira.hl7.org/browse/{p['key']}" for p in related)
+    submission.extend(["", "## Source and usage", "", f"Source: {analysis['metadata'].get('url')}"])
+    for profile in analysis.get("binding_context", []):
+        for binding in profile.get("bindings", []):
+            submission.append(f"- {profile.get('url')}: {binding.get('path')}; ValueSet {binding.get('value_set')}; {binding.get('strength')} binding.")
+    excluded = [r["request"]["source_code"] for r in prepared if r["issues"]]
+    if excluded:
+        submission.extend(["", "Incomplete requests excluded: " + ", ".join(excluded) + ". See proposal-draft.md."])
+    submission.extend(["", "ValueSet changes have not been inferred. Confirm ValueSet scope, target wording, and existing-code coverage before submission. These files do not modify THO source artifacts.", ""])
+    manifest = {"schema_version": "1.0", "source_system": analysis["metadata"].get("url"),
+                "proposal_rationale": analysis.get("proposal_rationale", ""),
+                "targets": [{"canonical": canonical, "changes": items} for canonical, items in groups.items()],
+                "reuse_mappings": [r["request"] for r in prepared if not r["issues"] and r["request"]["action"] == "reuse"],
+                "excluded": [r for r in prepared if r["issues"]], "submitted": False}
+    (directory / "proposal-draft.md").write_text(dossier, encoding="utf-8")
+    (directory / "proposal-submission.md").write_text("\n".join(submission), encoding="utf-8")
+    (directory / "proposal-changes.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def command_prepare_proposal(args: argparse.Namespace) -> int:
@@ -2169,9 +2238,9 @@ def command_prepare_proposal(args: argparse.Namespace) -> int:
         raise AnalysisError(f"Cannot load analysis and review files: {error}") from error
     apply_review_decisions(analysis, review)
     destination = directory / "proposal-draft.md"
-    if destination == review_path:
+    if review_path in {destination, directory / "proposal-submission.md", directory / "proposal-changes.json"}:
         raise AnalysisError("Proposal draft and review JSON must use separate paths.")
-    destination.write_text(render_proposal_draft(analysis), encoding="utf-8")
+    write_proposal_outputs(analysis, directory)
     print(f"Wrote {destination}")
     print("Working draft based on saved analysis evidence. Refresh analysis before relying on current Jira or draft-build status. Resolve placeholders and coordinate with existing tickets before submission.")
     return 0

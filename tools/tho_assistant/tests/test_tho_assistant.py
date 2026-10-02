@@ -43,6 +43,12 @@ class AnalyzerTests(unittest.TestCase):
         draft = tho_assistant.render_proposal_draft(analysis)
         self.assertIn("working proposal for steward review", draft)
         self.assertIn("action: add", draft)
+        request["rationale"] = ""
+        tho_assistant.apply_review_decisions(analysis, review)
+        draft = tho_assistant.render_proposal_draft(analysis)
+        self.assertIn("working proposal for steward review", draft)
+        self.assertIn("Rationale not provided (optional)", draft)
+        self.assertIn("| add | local | Local | Local concept. | LOCAL |", draft)
         request["relationship"] = "equivalent"
         tho_assistant.apply_review_decisions(analysis, review)
         self.assertIn("Addition requires", tho_assistant.render_proposal_draft(analysis))

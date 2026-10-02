@@ -1,5 +1,24 @@
 # THO Proposal Assistant
 
+## Submission preparation outputs
+
+Analysis and prepare-proposal now write three generated files:
+`proposal-draft.md` contains the review dossier; `proposal-submission.md` contains
+concise grouped change tables, optional rationale, usage, and related tickets;
+`proposal-changes.json` records complete changes by target, separate reuse mappings,
+and excluded requests with reasons. These are human-review working artifacts,
+not automatic Jira submissions or patched FHIR resources. Requested wording is
+preserved verbatim. ValueSet updates are not inferred. Regeneration replaces
+these files; keep hand edits in a separate working copy.
+
+Rationale is optional: missing rationale does not prevent a working proposal.
+The UI supports a shared proposal rationale plus per-code notes. Drafts include
+a grouped CodeSystem section with action/code/display/definition/source tables
+for complete requests. Unresolved requests remain in the detailed section and
+are excluded from grouped wording. Reuse mappings are separated from changes,
+and confirmed related tickets are retained for coordination. No rationale is
+invented from the absence of an exact code.
+
 Analysis now regenerates `proposal-draft.md` together with the JSON/Markdown
 reports and review page on every run. Save the edited review file and rerun the
 same full analysis command; a separate prepare-proposal call is unnecessary.
