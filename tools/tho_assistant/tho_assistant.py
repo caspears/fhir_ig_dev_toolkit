@@ -1479,6 +1479,21 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
     if not isinstance(review.get("proposal_rationale", ""), str):
         raise AnalysisError("Shared proposal rationale must be text.")
     analysis["proposal_rationale"] = review.get("proposal_rationale", "")
+    mode = review.get("proposal_mode", "undecided")
+    if mode not in {"undecided", "new", "coordinate"}:
+        raise AnalysisError("Proposal mode must be undecided, new, or coordinate.")
+    tickets = review.get("related_ticket_reviews", [])
+    if not isinstance(tickets, list):
+        raise AnalysisError("Related ticket reviews must be an array.")
+    seen_tickets = set()
+    for ticket in tickets:
+        if not isinstance(ticket, dict) or not isinstance(ticket.get("key"), str) or not re.fullmatch(r"UP-\d+", ticket["key"]) or ticket["key"] in seen_tickets:
+            raise AnalysisError("Related ticket reviews require unique UP ticket keys.")
+        if ticket.get("relationship") not in {"undecided", "covers-concepts", "same-artifact-different-change", "unrelated"} or not isinstance(ticket.get("note", ""), str):
+            raise AnalysisError("Invalid related ticket relationship or note.")
+        seen_tickets.add(ticket["key"])
+    analysis["proposal_mode"] = mode
+    analysis["related_ticket_reviews"] = copy.deepcopy(tickets)
 
 
 def maintain_review_file(analysis: dict[str, Any], path: Path) -> tuple[bool, int]:
@@ -2076,6 +2091,9 @@ def render_proposal_draft(analysis: dict[str, Any], prepared: list[dict[str, Any
              f"Source version: {analysis['metadata'].get('version') or 'unspecified'}", "",
              "## Reviewed scope", "",
              "Confirmed proposal mappings support coordination with existing tickets. System suitability selects a target for investigation only; it does not approve additions or equivalence."]
+    lines.extend(["", "Proposal route: " + analysis.get("proposal_mode", "undecided")])
+    for ticket in analysis.get("related_ticket_reviews", []):
+        lines.append(f"- Related ticket {ticket['key']}: {ticket['relationship']}. {_escape_table(ticket.get('note'))}")
     for recommendation in recommendations:
         code = recommendation["source_code"]
         lines.extend(["", f"## Candidate `{code}`", "", f"Next action: {recommendation['action']}", recommendation["reason"]])
@@ -2192,6 +2210,8 @@ def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
         if not row["issues"] and item["action"] != "reuse":
             groups.setdefault(item["target_system"], []).append(item)
     submission = ["# Proposed THO terminology changes", "", "Prepared for human submission review. No ticket has been created."]
+    mode = analysis.get("proposal_mode", "undecided")
+    submission.extend(["", "Proposal route: " + {"new": "New proposal for the requested changes.", "coordinate": "Coordinate with an existing proposal.", "undecided": "Not yet selected."}[mode]])
     if analysis.get("proposal_rationale"):
         submission.extend(["", "## Rationale", "", _escape_table(analysis["proposal_rationale"])])
     if not groups:
@@ -2208,8 +2228,14 @@ def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
                 submission.append("\nRationale: " + _escape_table(rationale))
         related = [p for p in analysis.get("proposal_matches", []) if canonical in p.get("target_canonicals", [])]
         if related:
-            submission.extend(["", "Related proposals to check before creating a ticket:"])
-            submission.extend(f"- {p['key']} ({p.get('status', 'unknown')}): https://jira.hl7.org/browse/{p['key']}" for p in related)
+            submission.extend(["", "Related-ticket review:"])
+            for p in related:
+                ticket = next((t for t in analysis.get("related_ticket_reviews", []) if t["key"] == p["key"]), {})
+                relationship = ticket.get("relationship", "undecided")
+                meaning = {"covers-concepts": "Covers requested concepts; coordinate to avoid duplicate changes.", "same-artifact-different-change": "Same artifact, different change; retain as a coordination dependency, not coverage of these additions.", "unrelated": "Dismissed as unrelated to this proposal.", "undecided": "Relationship needs review."}[relationship]
+                submission.append(f"- {p['key']} ({p.get('status', 'unknown')}): {meaning} {_escape_table(ticket.get('note'))} https://jira.hl7.org/browse/{p['key']}")
+                if mode == "new" and relationship == "covers-concepts":
+                    submission.append("  Review the new-proposal route against this overlapping scope before submission.")
     submission.extend(["", "## Source and usage", "", f"Source: {analysis['metadata'].get('url')}"])
     for profile in analysis.get("binding_context", []):
         for binding in profile.get("bindings", []):
@@ -2219,6 +2245,7 @@ def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
         submission.extend(["", "Incomplete requests excluded: " + ", ".join(excluded) + ". See proposal-draft.md."])
     submission.extend(["", "ValueSet changes have not been inferred. Confirm ValueSet scope, target wording, and existing-code coverage before submission. These files do not modify THO source artifacts.", ""])
     manifest = {"schema_version": "1.0", "source_system": analysis["metadata"].get("url"),
+                "proposal_mode": mode, "related_ticket_reviews": analysis.get("related_ticket_reviews", []),
                 "proposal_rationale": analysis.get("proposal_rationale", ""),
                 "targets": [{"canonical": canonical, "changes": items} for canonical, items in groups.items()],
                 "reuse_mappings": [r["request"] for r in prepared if not r["issues"] and r["request"]["action"] == "reuse"],
@@ -2274,6 +2301,7 @@ def command_review(args: argparse.Namespace) -> int:
         suggestions[concept["code"]] = suggested
     payload = {"review": review, "path": str(review_path), "concepts": analysis["concepts"],
                "catalog": catalog, "suggestions": suggestions,
+               "related_tickets": [{"key": p["key"], "status": p.get("status"), "target_canonicals": p.get("target_canonicals", [])} for p in analysis.get("proposal_matches", [])],
                "target_styles": {a["canonical"]: a["style_review"]["summaries"] for a in list(analysis.get("context_target_artifacts", [])) + [a for p in analysis.get("proposal_matches", []) for a in p.get("tho_target_artifacts", [])] if a.get("style_review")},
                "contexts": [next(({k: p.get(k) for k in ("context_alignment", "context_score", "context_evidence", "assessment")} for p in analysis.get("proposal_matches", []) if p.get("key") == d.get("proposal")), None) for d in review["decisions"]],
                "kinds": [next((c.get("decision_kind") for c in current if identity(c) == identity(d)), None) for d in review["decisions"]],

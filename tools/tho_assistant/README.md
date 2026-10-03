@@ -1,5 +1,20 @@
 # THO Proposal Assistant
 
+## Proposal route and related tickets
+
+Requested changes now include a proposal route (new/coordinate/undecided) and
+review of each related UP ticket: covers concepts, same artifact with a different
+change, unrelated, or undecided. Optional notes persist in the review JSON.
+All proposal outputs retain these choices. Same-artifact tickets remain
+coordination dependencies without implying coverage of the proposed additions.
+Choosing a new proposal while marking a ticket as covering the concepts produces
+a review reminder. These choices do not override code-equivalence decisions or
+change the requested codes. No tickets are created automatically.
+
+For PlanContactType, select New proposal and classify UP-872 as Same artifact,
+different change; optionally note that it advances versions. Download and replace
+the review file, then rerun the usual analysis command.
+
 ## Submission preparation outputs
 
 Analysis and prepare-proposal now write three generated files:

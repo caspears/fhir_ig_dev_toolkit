@@ -76,6 +76,14 @@ review.decisions.forEach((d,i)=>{
 });
 review.change_requests=review.change_requests||[];
 const rationaleLabel=add(document.getElementById('requests'),'label','Shared proposal rationale (optional)');const sharedRationale=document.createElement('textarea');sharedRationale.value=review.proposal_rationale||'';rationaleLabel.append(sharedRationale);sharedRationale.addEventListener('input',()=>review.proposal_rationale=sharedRationale.value);
+const routeLabel=add(document.getElementById('requests'),'label','Proposal route ');const route=document.createElement('select');[['undecided','Undecided'],['new','New proposal'],['coordinate','Coordinate with existing proposal']].forEach(([v,label])=>{const o=add(route,'option',label);o.value=v;});route.value=review.proposal_mode||'undecided';routeLabel.append(route);route.addEventListener('change',()=>review.proposal_mode=route.value);
+review.related_ticket_reviews=review.related_ticket_reviews||[];
+(payload.related_tickets||[]).forEach(ticket=>{
+ let saved=review.related_ticket_reviews.find(t=>t.key===ticket.key);if(!saved){saved={key:ticket.key,relationship:'undecided',note:''};review.related_ticket_reviews.push(saved);}
+ const section=add(document.getElementById('requests'),'article','');add(section,'h3','Related ticket '+ticket.key+' · '+(ticket.status||'unknown'));add(section,'p','Targets: '+ticket.target_canonicals.join(', '));
+ const l=add(section,'label','Relationship to this proposal ');const s=document.createElement('select');[['undecided','Undecided'],['covers-concepts','Covers the requested concepts'],['same-artifact-different-change','Same artifact, different change'],['unrelated','Unrelated']].forEach(([v,label])=>{const o=add(s,'option',label);o.value=v;});s.value=saved.relationship;l.append(s);s.addEventListener('change',()=>saved.relationship=s.value);
+ const notes=add(section,'label','Coordination note (optional)');const t=document.createElement('textarea');t.value=saved.note;notes.append(t);t.addEventListener('input',()=>saved.note=t.value);
+});
 payload.concepts.forEach(c=>{
  let r=review.change_requests.find(x=>x.source_code===c.code);
  if(!r){

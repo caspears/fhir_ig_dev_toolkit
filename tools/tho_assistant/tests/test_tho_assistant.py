@@ -49,6 +49,19 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("working proposal for steward review", draft)
         self.assertIn("Rationale not provided (optional)", draft)
         self.assertIn("| add | local | Local | Local concept. | LOCAL |", draft)
+        review["proposal_mode"] = "new"
+        review["related_ticket_reviews"] = [{"key": "UP-872", "relationship": "same-artifact-different-change", "note": "Version advancement only."}]
+        analysis["proposal_matches"] = [{"key": "UP-872", "status": "Environment Setup", "target_canonicals": [request["target_system"]]}]
+        tho_assistant.apply_review_decisions(analysis, review)
+        with tempfile.TemporaryDirectory() as folder:
+            tho_assistant.write_proposal_outputs(analysis, Path(folder))
+            text = (Path(folder) / "proposal-submission.md").read_text()
+            self.assertIn("New proposal for the requested changes", text)
+            self.assertIn("not coverage of these additions", text)
+            self.assertIn("Version advancement only", text)
+            manifest = json.loads((Path(folder) / "proposal-changes.json").read_text())
+            self.assertEqual(manifest["proposal_mode"], "new")
+            self.assertEqual(manifest["related_ticket_reviews"][0]["relationship"], "same-artifact-different-change")
         request["relationship"] = "equivalent"
         tho_assistant.apply_review_decisions(analysis, review)
         self.assertIn("Addition requires", tho_assistant.render_proposal_draft(analysis))
