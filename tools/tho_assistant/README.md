@@ -1,5 +1,36 @@
 # THO Proposal Assistant
 
+## Sponsor selection and approval tracking
+
+The ticket editor offers a visible workgroup dropdown and a free-text Sponsor
+field. Selecting a workgroup fills the editable field; another sponsor can be
+typed directly. Sponsor defaults never imply approval.
+
+After obtaining approval, record its status, associated UP ticket, date, and
+evidence reference in the review page. Record approval captures the saved ticket
+fields and requested changes. Download the review file and rerun analysis to
+validate. Incomplete records cannot authorize mocks; changed scope requires
+reapproval. Ticket JSON and the change manifest show effective approval status
+and mock_artifact_generation_allowed. This is an audit record of user-reported
+approval, not verification of workgroup minutes or automated approval requests.
+Actual mock artifact generation is the following increment and must enforce
+this status. No artifact generation or Jira writes occur in this increment.
+
+## Jira UP ticket mockup
+
+Analysis now writes `jira-ticket-draft.txt` (copyable field text) and
+`jira-ticket-draft.json` (fields, IDs, and generated defaults). The review page
+has editable Summary, Sponsor, Proposal Type, and plain-text Description fields.
+Manual overrides persist in the review JSON; Use generated resets an override.
+Refresh analysis after changing requests to refresh generated defaults.
+Existing target sponsors are suggested from structuredefinition-wg and resolved
+using the bundled HL7 workgroup lookup. Unknown or conflicting sponsors require
+selection. Workgroup names are offered in the sponsor input. Proposal Type uses
+the observed FHIR Vocabulary option; verify it against Jira's actual choices.
+No ticket is created and no sponsor approval is implied. Mock terminology artifacts
+remain a later stage after recorded sponsor approval. Preserve manual file edits
+in a separate working copy because generated outputs are overwritten.
+
 ## Proposal route and related tickets
 
 Requested changes now include a proposal route (new/coordinate/undecided) and

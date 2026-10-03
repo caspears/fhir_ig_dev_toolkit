@@ -1308,6 +1308,13 @@ def tho_catalog(package_dir: Path) -> list[dict[str, Any]]:
     indexed = _index_package_resources(package_dir, "CodeSystem")
     catalog = {r["url"]: {k: r.get(k) for k in ("url", "name", "title", "version", "description")}
                for r in indexed.values() if isinstance(r.get("url"), str) and is_tho_canonical(r["url"])}
+    workgroups = json.loads(Path(__file__).with_name("workgroups.json").read_text(encoding="utf-8"))["workgroups"]
+    for r in indexed.values():
+        if r.get("url") not in catalog:
+            continue
+        code = next((e.get("valueCode") for e in r.get("extension", []) if e.get("url") == "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg"), None)
+        catalog[r["url"]]["workgroup_code"] = code
+        catalog[r["url"]]["workgroup_name"] = workgroups.get(code)
     return [catalog[url] for url in sorted(catalog)]
 
 
@@ -1494,6 +1501,16 @@ def apply_review_decisions(analysis: dict[str, Any], review: dict[str, Any]) -> 
         seen_tickets.add(ticket["key"])
     analysis["proposal_mode"] = mode
     analysis["related_ticket_reviews"] = copy.deepcopy(tickets)
+    ticket_draft = review.get("jira_ticket", {})
+    if not isinstance(ticket_draft, dict) or any(not isinstance(ticket_draft.get(k, ""), str) for k in ("summary", "sponsor", "proposal_type", "description")):
+        raise AnalysisError("Jira ticket draft fields must be text.")
+    analysis["jira_ticket"] = copy.deepcopy(ticket_draft)
+    approval = review.get("sponsor_approval", {})
+    if not isinstance(approval, dict) or approval.get("status", "not-requested") not in {"not-requested", "pending", "approved", "declined"}:
+        raise AnalysisError("Invalid sponsor approval status.")
+    if any(not isinstance(approval.get(k, ""), str) for k in ("ticket", "date", "evidence")):
+        raise AnalysisError("Sponsor approval ticket, date, and evidence must be text.")
+    analysis["sponsor_approval"] = copy.deepcopy(approval)
 
 
 def maintain_review_file(analysis: dict[str, Any], path: Path) -> tuple[bool, int]:
@@ -2036,7 +2053,7 @@ def command_analyze(args: argparse.Namespace) -> int:
         raise AnalysisError("Use --review-file alone; --write-review-template is deprecated.")
     review_path = (args.review_file or args.write_review_template or
                    (output_dir / "review-decisions.json")).expanduser().resolve()
-    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", output_dir / "proposal-draft.md", output_dir / "proposal-submission.md", output_dir / "proposal-changes.json", output_dir / "review.html", source}:
+    if review_path in {output_dir / "analysis.json", output_dir / "concept-inventory.md", output_dir / "proposal-draft.md", output_dir / "proposal-submission.md", output_dir / "proposal-changes.json", output_dir / "jira-ticket-draft.txt", output_dir / "jira-ticket-draft.json", output_dir / "review.html", source}:
         raise AnalysisError("The review file must be separate from the input and generated reports.")
     created, added = maintain_review_file(result, review_path)
     result["recommendations"] = build_recommendations(result)
@@ -2051,6 +2068,7 @@ def command_analyze(args: argparse.Namespace) -> int:
     print(f"Wrote {output_dir / 'analysis.json'}")
     print(f"Wrote {output_dir / 'concept-inventory.md'}")
     print(f"Wrote {output_dir / 'proposal-draft.md'} (generated working draft; keep manual edits in a separate copy)")
+    print(f"Wrote {output_dir / 'jira-ticket-draft.txt'} (ticket fields for manual Jira entry)")
     print(f"Review file {'created' if created else 'reused'}: {review_path}")
     if added:
         print(f"Added {added} pending mappings; existing decisions and reviewed evidence preserved.")
@@ -2201,6 +2219,72 @@ def render_proposal_draft(analysis: dict[str, Any], prepared: list[dict[str, Any
     return "\n".join(lines)
 
 
+def build_jira_ticket(analysis: dict[str, Any], targets: list[dict[str, Any]]) -> dict[str, Any]:
+    catalog = {c["url"]: c for c in analysis.get("tho_code_system_catalog", [])}
+    names = [catalog.get(t["canonical"], {}).get("title") or t["canonical"].rsplit("/", 1)[-1] for t in targets]
+    changes = [c for t in targets for c in t["changes"]]
+    counts = {a: sum(c["action"] == a for c in changes) for a in ("add", "modify", "create-system")}
+    parts = []
+    if counts["add"]: parts.append(f"Add {counts['add']} codes")
+    if counts["modify"]: parts.append(f"modify {counts['modify']} codes")
+    if counts["create-system"]: parts.append("create new CodeSystem content")
+    summary = " and ".join(parts) + " in " + ", ".join(names) if parts else ""
+    sponsors = sorted({catalog.get(t["canonical"], {}).get("workgroup_name") for t in targets} - {None, ""})
+    sponsor = sponsors[0] if len(sponsors) == 1 and all(catalog.get(t["canonical"], {}).get("workgroup_name") for t in targets) else ""
+    description = ["PROPOSED CHANGE", summary or "No complete terminology change requests are available."]
+    for target in targets:
+        canonical = target["canonical"]
+        description.extend(["", "TARGET CODESYSTEM", canonical])
+        for item in target["changes"]:
+            description.extend(["", item["action"].upper() + " CODE: " + item["target_code"]])
+            if item["action"] == "modify":
+                artifacts = list(analysis.get("context_target_artifacts", [])) + [a for p in analysis.get("proposal_matches", []) for a in p.get("tho_target_artifacts", [])]
+                row = next((r for a in artifacts if a.get("canonical") == canonical for r in a.get("concept_comparison", []) if r.get("target_code") == item["target_code"]), {})
+                description.extend(["Current display: " + (row.get("target_display") or "[Not available]"), "Current definition: " + (row.get("target_definition") or "[Not available]")])
+            description.extend(["Proposed display: " + item.get("display", ""), "Proposed definition: " + item.get("definition", "")])
+            if item.get("system_scope"): description.append("New system scope: " + item["system_scope"])
+            if item.get("rationale"): description.append("Rationale: " + item["rationale"])
+    if analysis.get("proposal_rationale"):
+        description.extend(["", "RATIONALE", analysis["proposal_rationale"]])
+    description.extend(["", "IG USAGE", analysis["metadata"].get("url", "")])
+    for profile in analysis.get("binding_context", []):
+        for b in profile.get("bindings", []):
+            description.append(f"{profile.get('url')}: {b.get('path')}; ValueSet {b.get('value_set')}; binding {b.get('strength')}.")
+    related = [p for p in analysis.get("proposal_matches", []) if include_related_work(p) and any(t["canonical"] in p.get("target_canonicals", []) for t in targets)]
+    if related:
+        description.extend(["", "RELATED WORK"])
+        for p in related:
+            review = next((r for r in analysis.get("related_ticket_reviews", []) if r["key"] == p["key"]), {})
+            if review.get("relationship") == "unrelated": continue
+            description.append(f"{p['key']} ({p.get('status')}): {review.get('relationship', 'relationship not reviewed')}. {review.get('note', '')} https://jira.hl7.org/browse/{p['key']}")
+    defaults = {"summary": summary, "sponsor": sponsor, "proposal_type": "FHIR Vocabulary (only those UTG maintained)", "description": "\n".join(description)}
+    return {"fields": {k: analysis.get("jira_ticket", {}).get(k) or v for k, v in defaults.items()}, "defaults": defaults, "sponsor_candidates": sponsors, "submitted": False,
+            "field_ids": {"summary": "summary", "sponsor": "customfield_10425", "proposal_type": "customfield_10423", "description": "customfield_10426"}}
+
+
+def sponsor_approval_status(analysis: dict[str, Any], ticket: dict[str, Any], targets: list[dict[str, Any]]) -> dict[str, Any]:
+    saved = analysis.get("sponsor_approval", {})
+    status = saved.get("status", "not-requested")
+    scope = {"fields": ticket["fields"], "targets": targets}
+    if status == "approved":
+        if not targets or not ticket["fields"].get("sponsor") or not re.fullmatch(r"UP-\d+", saved.get("ticket", "")) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved.get("date", "")) or not saved.get("evidence", "").strip():
+            status = "incomplete-approval-record"
+        elif saved.get("reviewed_scope") != scope:
+            status = "requires-reapproval"
+    return {**saved, "effective_status": status, "current_scope": scope,
+            "mock_artifact_generation_allowed": status == "approved"}
+
+
+def include_related_work(proposal: dict[str, Any]) -> bool:
+    for field in ("status", "resolution"):
+        value = proposal.get(field)
+        if isinstance(value, dict):
+            value = value.get("name")
+        if isinstance(value, str) and value.strip().casefold() in {"applied", "withdrawn", "abandoned"}:
+            return False
+    return True
+
+
 def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
     prepared = []
     dossier = render_proposal_draft(analysis, prepared)
@@ -2226,7 +2310,7 @@ def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
         for rationale in dict.fromkeys(item.get("rationale", "") for item in items):
             if rationale:
                 submission.append("\nRationale: " + _escape_table(rationale))
-        related = [p for p in analysis.get("proposal_matches", []) if canonical in p.get("target_canonicals", [])]
+        related = [p for p in analysis.get("proposal_matches", []) if canonical in p.get("target_canonicals", []) and include_related_work(p)]
         if related:
             submission.extend(["", "Related-ticket review:"])
             for p in related:
@@ -2253,6 +2337,13 @@ def write_proposal_outputs(analysis: dict[str, Any], directory: Path) -> None:
     (directory / "proposal-draft.md").write_text(dossier, encoding="utf-8")
     (directory / "proposal-submission.md").write_text("\n".join(submission), encoding="utf-8")
     (directory / "proposal-changes.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    ticket = build_jira_ticket(analysis, manifest["targets"])
+    approval = sponsor_approval_status(analysis, ticket, manifest["targets"])
+    ticket["sponsor_approval"] = approval
+    manifest["sponsor_approval"] = approval
+    (directory / "proposal-changes.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (directory / "jira-ticket-draft.json").write_text(json.dumps(ticket, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (directory / "jira-ticket-draft.txt").write_text("JIRA UP TICKET DRAFT — NOT SUBMITTED\n\n" + "\n\n".join(label + ":\n" + (ticket["fields"][key] or "[Select / enter]") for key, label in (("summary", "Summary"), ("sponsor", "Sponsor"), ("proposal_type", "Proposal Type"), ("description", "Proposal Description"))) + "\n", encoding="utf-8")
 
 
 def command_prepare_proposal(args: argparse.Namespace) -> int:
@@ -2265,7 +2356,7 @@ def command_prepare_proposal(args: argparse.Namespace) -> int:
         raise AnalysisError(f"Cannot load analysis and review files: {error}") from error
     apply_review_decisions(analysis, review)
     destination = directory / "proposal-draft.md"
-    if review_path in {destination, directory / "proposal-submission.md", directory / "proposal-changes.json"}:
+    if review_path in {destination, directory / "proposal-submission.md", directory / "proposal-changes.json", directory / "jira-ticket-draft.txt", directory / "jira-ticket-draft.json"}:
         raise AnalysisError("Proposal draft and review JSON must use separate paths.")
     write_proposal_outputs(analysis, directory)
     print(f"Wrote {destination}")
@@ -2299,7 +2390,18 @@ def command_review(args: argparse.Namespace) -> int:
                 if is_tho_canonical(canonical):
                     suggested.setdefault(canonical, []).append(f"{proposal['key']} · context {proposal.get('context_alignment', 'unknown')}")
         suggestions[concept["code"]] = suggested
+    analysis["tho_code_system_catalog"] = catalog
+    prepared = []
+    render_proposal_draft(analysis, prepared)
+    complete_changes = [r["request"] for r in prepared if not r["issues"] and r["request"]["action"] != "reuse"]
+    ticket_targets = [{"canonical": canonical, "changes": [r for r in complete_changes if r["target_system"] == canonical]} for canonical in sorted({r["target_system"] for r in complete_changes})]
+    ticket_preview = build_jira_ticket(analysis, ticket_targets)
+    show_ticket = bool(complete_changes) and not any(r["issues"] for r in prepared) and any(d.get("effective_status") == "confirmed" for d in analysis["review_decisions"])
     payload = {"review": review, "path": str(review_path), "concepts": analysis["concepts"],
+               "show_ticket": show_ticket,
+               "sponsor_approval": sponsor_approval_status(analysis, ticket_preview, ticket_targets),
+               "workgroups": sorted(json.loads(Path(__file__).with_name("workgroups.json").read_text(encoding="utf-8"))["workgroups"].values()),
+               "jira_ticket": build_jira_ticket(analysis, ticket_targets),
                "catalog": catalog, "suggestions": suggestions,
                "related_tickets": [{"key": p["key"], "status": p.get("status"), "target_canonicals": p.get("target_canonicals", [])} for p in analysis.get("proposal_matches", [])],
                "target_styles": {a["canonical"]: a["style_review"]["summaries"] for a in list(analysis.get("context_target_artifacts", [])) + [a for p in analysis.get("proposal_matches", []) for a in p.get("tho_target_artifacts", [])] if a.get("style_review")},

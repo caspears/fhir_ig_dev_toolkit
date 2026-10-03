@@ -15,6 +15,36 @@ SPEC.loader.exec_module(tho_assistant)
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_sponsor_approval_is_scoped_and_requires_evidence(self):
+        ticket = {"fields": {"sponsor": "Patient Administration", "summary": "Add codes"}}
+        targets = [{"canonical": "urn:target", "changes": [{"target_code": "MARKETING"}]}]
+        analysis = {"sponsor_approval": {"status": "approved", "ticket": "UP-123", "date": "2026-10-02", "evidence": "WG minutes", "reviewed_scope": {"fields": ticket["fields"].copy(), "targets": targets}}}
+        self.assertTrue(tho_assistant.sponsor_approval_status(analysis, ticket, targets)["mock_artifact_generation_allowed"])
+        ticket["fields"]["sponsor"] = "Financial Management"
+        self.assertEqual(tho_assistant.sponsor_approval_status(analysis, ticket, targets)["effective_status"], "requires-reapproval")
+        analysis["sponsor_approval"]["evidence"] = ""
+        self.assertEqual(tho_assistant.sponsor_approval_status(analysis, ticket, targets)["effective_status"], "incomplete-approval-record")
+
+    def test_ticket_fields_sponsor_plain_text_and_related_filter(self):
+        url = "http://terminology.hl7.org/CodeSystem/contactentity-type"
+        analysis = {"metadata": {"url": "urn:source"}, "tho_code_system_catalog": [{"url": url, "title": "Contact entity type", "workgroup_name": "Patient Administration"}],
+                    "proposal_matches": [{"key": "UP-872", "status": "Environment Setup", "target_canonicals": [url]}, {"key": "UP-1", "status": "Applied", "target_canonicals": [url]}],
+                    "related_ticket_reviews": [{"key": "UP-872", "relationship": "same-artifact-different-change", "note": "Version advancement"}]}
+        targets = [{"canonical": url, "changes": [{"action": "add", "target_code": "MARKETING", "display": "Marketing", "definition": "Plan Marketing Information."}]}]
+        ticket = tho_assistant.build_jira_ticket(analysis, targets)
+        self.assertEqual(ticket["fields"]["sponsor"], "Patient Administration")
+        self.assertIn("Add 1 codes", ticket["fields"]["summary"])
+        self.assertIn("ADD CODE: MARKETING", ticket["fields"]["description"])
+        self.assertNotIn("UP-1 (", ticket["fields"]["description"])
+        analysis["jira_ticket"] = {"summary": "My summary"}
+        self.assertEqual(tho_assistant.build_jira_ticket(analysis, targets)["fields"]["summary"], "My summary")
+
+    def test_related_work_omits_applied_and_withdrawn_only(self):
+        for proposal in ({"status": "Applied"}, {"status": "Withdrawn"}, {"resolution": {"name": "Withdrawn"}}, {"resolution": "Abandoned"}):
+            self.assertFalse(tho_assistant.include_related_work(proposal))
+        self.assertTrue(tho_assistant.include_related_work({"status": "Content Check", "resolution": None}))
+        self.assertTrue(tho_assistant.include_related_work({"status": "Resolved"}))
+
     def test_multiple_confirmed_mappings_are_rejected(self):
         analysis = tho_assistant.analyze({"url": "urn:source", "concept": [{"code": "local"}]}, Path("source.json"))
         review = tho_assistant.build_review_template(analysis)
